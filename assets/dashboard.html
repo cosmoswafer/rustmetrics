@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rustmetrics</title>
+<style>
+:root {
+  --bg: #0f1117; --panel: #171a23; --border: #2a2f3d; --text: #d8dce6;
+  --muted: #8a92a6; --accent: #4cc38a; --danger: #e5534b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: flex; min-height: 100vh;
+}
+#sidebar {
+  width: 280px; flex: none; background: var(--panel);
+  border-right: 1px solid var(--border); padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  height: 100vh; position: sticky; top: 0;
+}
+#sidebar h1 { font-size: 16px; margin: 0; color: var(--accent); }
+#sidebar h1 small { color: var(--muted); font-weight: normal; margin-left: 6px; }
+#search {
+  width: 100%; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+#metric-list { overflow-y: auto; flex: 1; margin: 0; padding: 0; list-style: none; }
+#metric-list li {
+  padding: 6px 8px; border-radius: 6px; cursor: pointer;
+  display: flex; justify-content: space-between; gap: 6px; align-items: baseline;
+}
+#metric-list li:hover { background: #1f2430; }
+#metric-list li.selected { background: #24466a; }
+#metric-list .kind { color: var(--muted); font-size: 11px; flex: none; }
+#main { flex: 1; padding: 16px 20px; min-width: 0; }
+#toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+#toolbar button {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 12px; cursor: pointer;
+}
+#toolbar button.active { background: #24466a; border-color: #3b6ea5; }
+#toolbar .spacer { flex: 1; }
+#status { color: var(--muted); font-size: 12px; }
+.panel {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px; margin-bottom: 16px;
+}
+.panel h2 { margin: 0 0 2px; font-size: 15px; display: flex; align-items: baseline; gap: 8px; }
+.panel h2 .kind { color: var(--muted); font-size: 11px; font-weight: normal; }
+.panel .help { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.filters select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 6px; font-size: 12px; max-width: 220px;
+}
+.filters label { color: var(--muted); font-size: 12px; }
+svg.chart { width: 100%; height: 220px; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 12px; }
+.legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+.empty { color: var(--muted); padding: 30px 0; text-align: center; }
+#tooltip {
+  position: fixed; pointer-events: none; display: none; z-index: 10;
+  background: #000c; border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 9px; font-size: 12px; white-space: pre;
+}
+.axis text { fill: var(--muted); font-size: 10px; }
+.axis line { stroke: var(--border); }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h1>rustmetrics<small>dashboard</small></h1>
+  <input id="search" type="search" placeholder="Filter metrics…">
+  <ul id="metric-list"></ul>
+  <noscript>This dashboard requires JavaScript. The JSON API at /api/metrics and /api/query works without it.</noscript>
+</div>
+<div id="main">
+  <div id="toolbar">
+    <span style="color:var(--muted)">Range:</span>
+    <button data-range="900">15m</button>
+    <button data-range="3600" class="active">1h</button>
+    <button data-range="21600">6h</button>
+    <button data-range="86400">24h</button>
+    <span class="spacer"></span>
+    <button id="refresh-toggle" class="active">Auto-refresh: on</button>
+    <span id="status"></span>
+  </div>
+  <div id="panels"><div class="empty">Select a metric from the sidebar to plot it.</div></div>
+</div>
+<div id="tooltip"></div>
+<script>
+"use strict";
+const COLORS = ["#4cc38a","#5aa9e6","#e6b455","#e5534b","#b18ae6","#5ae6d5","#e68ac6","#a4e65a"];
+const state = {
+  metrics: [],
+  selected: new Map(),   // name -> { filters: Map(label->value) }
+  rangeSec: 3600,
+  autoRefresh: true,
+  timer: null,
+};
+
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function fetchJson(url) {
+  const res = await fetch(url);
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error || res.statusText);
+  return body;
+}
+
+async function loadMetricList() {
+  const data = await fetchJson("/api/metrics");
+  state.metrics = data.metrics;
+  renderMetricList();
+}
+
+function renderMetricList() {
+  const filter = $("#search").value.toLowerCase();
+  const ul = $("#metric-list");
+  ul.innerHTML = "";
+  for (const m of state.metrics) {
+    if (filter && !m.name.toLowerCase().includes(filter)) continue;
+    const li = document.createElement("li");
+    li.className = state.selected.has(m.name) ? "selected" : "";
+    li.innerHTML = `<span>${esc(m.name)}</span><span class="kind">${esc(m.kind)} · ${m.series}</span>`;
+    li.title = m.help || m.name;
+    li.onclick = () => toggleMetric(m.name);
+    ul.appendChild(li);
+  }
+}
+
+function toggleMetric(name) {
+  if (state.selected.has(name)) state.selected.delete(name);
+  else state.selected.set(name, { filters: new Map() });
+  renderMetricList();
+  refresh();
+}
+
+function queryUrl(name, sel) {
+  const to = Date.now();
+  const from = to - state.rangeSec * 1000;
+  const params = new URLSearchParams({ metric: name, from, to });
+  for (const [k, v] of sel.filters) if (v) params.set("label." + k, v);
+  return "/api/query?" + params.toString();
+}
+
+async function refresh() {
+  const panels = $("#panels");
+  if (state.selected.size === 0) {
+    panels.innerHTML = '<div class="empty">Select a metric from the sidebar to plot it.</div>';
+    return;
+  }
+  const jobs = [...state.selected.entries()].map(async ([name, sel]) => {
+    const meta = state.metrics.find(m => m.name === name) || { kind: "untyped", help: "" };
+    const [labels, data] = await Promise.all([
+      fetchJson("/api/labels?metric=" + encodeURIComponent(name)),
+      fetchJson(queryUrl(name, sel)),
+    ]);
+    return { name, sel, meta, labels: labels.labels, data };
+  });
+  try {
+    const results = await Promise.all(jobs);
+    panels.innerHTML = "";
+    for (const r of results) panels.appendChild(renderPanel(r));
+    $("#status").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("#status").textContent = "error: " + e.message;
+  }
+}
+
+function renderPanel({ name, sel, meta, labels, data }) {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  const h2 = document.createElement("h2");
+  h2.innerHTML = `${esc(name)} <span class="kind">${esc(meta.kind)}</span>`;
+  panel.appendChild(h2);
+  if (meta.help) {
+    const p = document.createElement("p");
+    p.className = "help";
+    p.textContent = meta.help;
+    panel.appendChild(p);
+  }
+
+  const labelNames = Object.keys(labels);
+  if (labelNames.length) {
+    const filters = document.createElement("div");
+    filters.className = "filters";
+    for (const ln of labelNames) {
+      const wrap = document.createElement("label");
+      wrap.textContent = ln + " ";
+      const select = document.createElement("select");
+      select.innerHTML = '<option value="">(all)</option>' +
+        labels[ln].map(v => `<option${sel.filters.get(ln) === v ? " selected" : ""}>${esc(v)}</option>`).join("");
+      select.onchange = () => { sel.filters.set(ln, select.value); refresh(); };
+      wrap.appendChild(select);
+      filters.appendChild(wrap);
+    }
+    panel.appendChild(filters);
+  }
+
+  if (!data.series.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "no data in range";
+    panel.appendChild(empty);
+    return panel;
+  }
+  panel.appendChild(renderChart(data));
+
+  const legend = document.createElement("div");
+  legend.className = "legend";
+  data.series.forEach((s, i) => {
+    const item = document.createElement("span");
+    const labelText = Object.entries(s.labels).map(([k, v]) => `${k}="${v}"`).join(", ") || "(no labels)";
+    item.innerHTML = `<span class="swatch" style="background:${COLORS[i % COLORS.length]}"></span>${esc(labelText)}`;
+    legend.appendChild(item);
+  });
+  panel.appendChild(legend);
+  return panel;
+}
+
+function renderChart(data) {
+  const W = 900, H = 220, ML = 58, MR = 12, MT = 10, MB = 24;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "chart");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+
+  const allPoints = data.series.flatMap(s => s.points).filter(p => p[1] !== null);
+  const t0 = data.from, t1 = data.to;
+  let vMin = Math.min(...allPoints.map(p => p[1]));
+  let vMax = Math.max(...allPoints.map(p => p[1]));
+  if (!isFinite(vMin) || !isFinite(vMax)) { vMin = 0; vMax = 1; }
+  if (vMin === vMax) { vMin -= 1; vMax += 1; }
+  const pad = (vMax - vMin) * 0.08;
+  vMin -= pad; vMax += pad;
+
+  const x = t => ML + (t - t0) / (t1 - t0 || 1) * (W - ML - MR);
+  const y = v => MT + (1 - (v - vMin) / (vMax - vMin)) * (H - MT - MB);
+
+  const axis = document.createElementNS(svg.namespaceURI, "g");
+  axis.setAttribute("class", "axis");
+  for (let i = 0; i <= 4; i++) {
+    const v = vMin + (vMax - vMin) * i / 4;
+    const gy = y(v);
+    axis.innerHTML += `<line x1="${ML}" y1="${gy}" x2="${W - MR}" y2="${gy}"/>` +
+      `<text x="${ML - 6}" y="${gy + 3}" text-anchor="end">${fmtVal(v)}</text>`;
+  }
+  for (let i = 0; i <= 5; i++) {
+    const t = t0 + (t1 - t0) * i / 5;
+    const gx = x(t);
+    axis.innerHTML += `<text x="${gx}" y="${H - 8}" text-anchor="middle">${fmtTime(t)}</text>`;
+  }
+  svg.appendChild(axis);
+
+  data.series.forEach((s, i) => {
+    const pts = s.points.filter(p => p[1] !== null);
+    if (!pts.length) return;
+    const path = pts.map((p, j) => `${j ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
+    const el = document.createElementNS(svg.namespaceURI, "path");
+    el.setAttribute("d", path);
+    el.setAttribute("fill", "none");
+    el.setAttribute("stroke", COLORS[i % COLORS.length]);
+    el.setAttribute("stroke-width", "1.6");
+    el.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(el);
+  });
+
+  svg.addEventListener("mousemove", (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const t = t0 + ((ev.clientX - rect.left) / rect.width * W - ML) / (W - ML - MR) * (t1 - t0);
+    let best = null;
+    data.series.forEach((s, i) => {
+      for (const p of s.points) {
+        if (p[1] === null) continue;
+        const d = Math.abs(p[0] - t);
+        if (!best || d < best.d) best = { d, p, s, i };
+      }
+    });
+    const tip = $("#tooltip");
+    if (!best) { tip.style.display = "none"; return; }
+    const labelText = Object.entries(best.s.labels).map(([k, v]) => `${k}="${v}"`).join(", ");
+    tip.textContent = `${new Date(best.p[0]).toLocaleString()}\n${labelText || "(no labels)"}\nvalue: ${best.p[1]}`;
+    tip.style.display = "block";
+    tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - 240) + "px";
+    tip.style.top = (ev.clientY + 14) + "px";
+  });
+  svg.addEventListener("mouseleave", () => { $("#tooltip").style.display = "none"; });
+  return svg;
+}
+
+function fmtVal(v) {
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(1) + "G";
+  if (a >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (a >= 1e3) return (v / 1e3).toFixed(1) + "k";
+  if (a >= 1 || v === 0) return v.toFixed(a >= 100 ? 0 : 2);
+  return v.toPrecision(3);
+}
+function fmtTime(t) {
+  const d = new Date(t);
+  return state.rangeSec > 21600
+    ? d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0")
+    : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function scheduleRefresh() {
+  clearInterval(state.timer);
+  if (state.autoRefresh) {
+    state.timer = setInterval(async () => { await loadMetricList(); await refresh(); }, 10000);
+  }
+}
+
+document.querySelectorAll("#toolbar [data-range]").forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll("#toolbar [data-range]").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    state.rangeSec = Number(btn.dataset.range);
+    refresh();
+  };
+});
+$("#refresh-toggle").onclick = () => {
+  state.autoRefresh = !state.autoRefresh;
+  $("#refresh-toggle").textContent = "Auto-refresh: " + (state.autoRefresh ? "on" : "off");
+  $("#refresh-toggle").classList.toggle("active", state.autoRefresh);
+  scheduleRefresh();
+};
+$("#search").oninput = renderMetricList;
+
+loadMetricList().then(() => {
+  // preselect `up` if present so scrape setups show something immediately
+  if (state.metrics.some(m => m.name === "up")) toggleMetric("up");
+}).catch(e => { $("#status").textContent = "error: " + e.message; });
+scheduleRefresh();
+</script>
+</body>
+</html>

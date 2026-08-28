@@ -1,0 +1,8 @@
+[package]
+name = "rustmetrics"
+version = "0.1.0"
+edition = "2021"
+description = "Minimalist zero-config, zero-dependency metrics collection & dashboard system"
+license = "MIT"
+
+[dependencies]
