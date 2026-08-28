@@ -1,8 +1,6 @@
 pub mod api;
 pub mod config;
 pub mod dashboard;
-pub mod http;
-pub mod json;
 pub mod model;
 pub mod scraper;
 pub mod snapshot;

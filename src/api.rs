@@ -1,12 +1,19 @@
-//! HTTP route table: parsed Request -> handler -> Response.
+//! HTTP API: axum router and handlers.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Serialize;
+
 use crate::dashboard;
-use crate::http::{Method, QueryParams, Request, Response};
-use crate::json::JsonWriter;
-use crate::model::{LabelName, LabelValue, MetricMeta, MetricName, TimestampMs};
+use crate::model::{LabelName, LabelValue, MetricName, TimestampMs};
 use crate::storage::{MetricStore, QueryRange};
 use crate::textfmt;
 
@@ -27,207 +34,256 @@ impl AppState {
     }
 }
 
-pub fn handle(state: &AppState, req: Request) -> Response {
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(get_dashboard))
+        .route("/api/push", post(post_push))
+        .route("/api/metrics", get(get_metrics_list))
+        .route("/api/labels", get(get_labels))
+        .route("/api/query", get(get_query))
+        .route("/metrics", get(get_self_metrics))
+        .fallback(fallback)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            count_requests,
+        ))
+        .with_state(state)
+}
+
+async fn count_requests(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
     state.http_requests_total.fetch_add(1, Ordering::Relaxed);
-    match (req.method, req.path.as_str()) {
-        (Method::Get, "/") => Response::html(dashboard::PAGE),
-        (Method::Post, "/api/push") => handle_push(state, &req.body),
-        (Method::Get, "/api/metrics") => handle_list(state),
-        (Method::Get, "/api/labels") => handle_labels(state, &req.query),
-        (Method::Get, "/api/query") => handle_query(state, &req.query),
-        (Method::Get, "/metrics") => handle_self_metrics(state),
-        (Method::Post, "/")
-        | (Method::Post, "/api/metrics")
-        | (Method::Post, "/api/labels")
-        | (Method::Post, "/api/query")
-        | (Method::Post, "/metrics") => Response::json_error(405, "method not allowed"),
-        (Method::Get, "/api/push") => Response::json_error(405, "use POST"),
-        _ => Response::json_error(404, "not found"),
-    }
+    next.run(req).await
 }
 
-fn handle_push(state: &AppState, body: &[u8]) -> Response {
-    let text = match std::str::from_utf8(body) {
-        Ok(t) => t,
-        Err(_) => return Response::json_error(400, "push body is not valid UTF-8"),
-    };
-    match textfmt::parse(text) {
-        Ok(parsed) => {
-            state
-                .store
-                .ingest(parsed.samples, parsed.metas, TimestampMs::now());
-            Response::no_content()
+/// JSON error body with a status code; the only error shape handlers return.
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
         }
-        Err(e) => Response::json_error(400, &e.to_string()),
     }
 }
 
-fn handle_list(state: &AppState) -> Response {
-    let mut w = JsonWriter::new();
-    w.begin_object();
-    w.key("metrics").begin_array();
-    for info in state.store.list_metrics() {
-        w.begin_object();
-        w.key("name").string(info.name.as_str());
-        w.key("kind").string(info.meta.kind.as_str());
-        w.key("help").string(&info.meta.help);
-        w.key("series").int(info.series_count as i64);
-        w.end_object();
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = serde_json::json!({ "error": self.message });
+        (self.status, Json(body)).into_response()
     }
-    w.end_array();
-    w.end_object();
-    Response::json(200, w.finish())
 }
 
-fn handle_labels(state: &AppState, query: &QueryParams) -> Response {
-    let metric = match parse_metric_param(query) {
-        Ok(m) => m,
-        Err(resp) => return *resp,
-    };
-    let mut w = JsonWriter::new();
-    w.begin_object();
-    w.key("metric").string(metric.as_str());
-    w.key("labels").begin_object();
-    for (name, values) in state.store.label_values(&metric) {
-        w.key(name.as_str()).begin_array();
-        for v in values {
-            w.string(v.as_str());
-        }
-        w.end_array();
+async fn fallback() -> ApiError {
+    ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "not found".to_string(),
     }
-    w.end_object();
-    w.end_object();
-    Response::json(200, w.finish())
 }
 
-fn handle_query(state: &AppState, query: &QueryParams) -> Response {
-    let metric = match parse_metric_param(query) {
-        Ok(m) => m,
-        Err(resp) => return *resp,
-    };
+async fn get_dashboard() -> Html<&'static str> {
+    Html(dashboard::PAGE)
+}
+
+async fn post_push(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let parsed = textfmt::parse(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    state
+        .store
+        .ingest(parsed.samples, parsed.metas, TimestampMs::now());
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct MetricsResponse {
+    metrics: Vec<MetricEntry>,
+}
+
+#[derive(Serialize)]
+struct MetricEntry {
+    name: String,
+    kind: &'static str,
+    help: String,
+    series: usize,
+}
+
+async fn get_metrics_list(State(state): State<Arc<AppState>>) -> Json<MetricsResponse> {
+    let metrics = state
+        .store
+        .list_metrics()
+        .into_iter()
+        .map(|info| MetricEntry {
+            name: info.name.as_str().to_string(),
+            kind: info.meta.kind.as_str(),
+            help: info.meta.help,
+            series: info.series_count,
+        })
+        .collect();
+    Json(MetricsResponse { metrics })
+}
+
+#[derive(Serialize)]
+struct LabelsResponse {
+    metric: String,
+    labels: BTreeMap<String, Vec<String>>,
+}
+
+async fn get_labels(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> Result<Json<LabelsResponse>, ApiError> {
+    let metric = parse_metric_param(&params)?;
+    let labels = state
+        .store
+        .label_values(&metric)
+        .into_iter()
+        .map(|(name, values)| {
+            (
+                name.as_str().to_string(),
+                values.into_iter().map(|v| v.as_str().to_string()).collect(),
+            )
+        })
+        .collect();
+    Ok(Json(LabelsResponse {
+        metric: metric.as_str().to_string(),
+        labels,
+    }))
+}
+
+#[derive(Serialize)]
+struct QueryResponse {
+    metric: String,
+    from: i64,
+    to: i64,
+    step: i64,
+    series: Vec<SeriesEntry>,
+}
+
+#[derive(Serialize)]
+struct SeriesEntry {
+    labels: BTreeMap<String, String>,
+    /// [ts_ms, value] pairs; non-finite values become null.
+    points: Vec<(i64, Option<f64>)>,
+}
+
+async fn get_query(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> Result<Json<QueryResponse>, ApiError> {
+    let metric = parse_metric_param(&params)?;
 
     let now = TimestampMs::now();
-    let to = match parse_ts_param(query, "to", now) {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
-    let from = match parse_ts_param(query, "from", to.saturating_sub_millis(DEFAULT_RANGE_MS)) {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+    let to = parse_ts_param(&params, "to", now)?;
+    let from = parse_ts_param(&params, "from", to.saturating_sub_millis(DEFAULT_RANGE_MS))?;
     if from > to {
-        return Response::json_error(400, "query: from is after to");
+        return Err(ApiError::bad_request("query: from is after to"));
     }
 
-    let step_ms = match query.get("step") {
+    let step_ms = match params.get("step").map(String::as_str) {
+        None | Some("") => ((to.as_millis() - from.as_millis()) / AUTO_STEP_BUCKETS).max(1),
         Some(raw) => match raw.parse::<i64>() {
             Ok(v) if v > 0 => v,
             _ => {
-                return Response::json_error(400, &format!("query: invalid step {raw:?}"));
+                return Err(ApiError::bad_request(format!(
+                    "query: invalid step {raw:?}"
+                )))
             }
         },
-        None => ((to.as_millis() - from.as_millis()) / AUTO_STEP_BUCKETS).max(1),
     };
 
     let mut filters: Vec<(LabelName, LabelValue)> = Vec::new();
-    for (k, v) in query.iter() {
+    for (k, v) in &params {
         if let Some(label) = k.strip_prefix("label.") {
-            match LabelName::parse(label) {
-                Ok(name) => filters.push((name, LabelValue::new(v))),
-                Err(_) => {
-                    return Response::json_error(
-                        400,
-                        &format!("query: invalid label name {label:?}"),
-                    );
-                }
-            }
+            let name = LabelName::parse(label).map_err(|_| {
+                ApiError::bad_request(format!("query: invalid label name {label:?}"))
+            })?;
+            filters.push((name, LabelValue::new(v.clone())));
         }
     }
 
     let range = QueryRange { from, to, step_ms };
-    let result = state.store.query(&metric, &filters, &range);
+    let series = state
+        .store
+        .query(&metric, &filters, &range)
+        .into_iter()
+        .map(|s| SeriesEntry {
+            labels: s
+                .labels
+                .iter()
+                .map(|(n, v)| (n.as_str().to_string(), v.as_str().to_string()))
+                .collect(),
+            points: s
+                .points
+                .into_iter()
+                .map(|p| (p.ts.as_millis(), p.value.is_finite().then_some(p.value)))
+                .collect(),
+        })
+        .collect();
 
-    let mut w = JsonWriter::new();
-    w.begin_object();
-    w.key("metric").string(metric.as_str());
-    w.key("from").int(from.as_millis());
-    w.key("to").int(to.as_millis());
-    w.key("step").int(step_ms);
-    w.key("series").begin_array();
-    for s in result {
-        w.begin_object();
-        w.key("labels").begin_object();
-        for (n, v) in s.labels.iter() {
-            w.key(n.as_str()).string(v.as_str());
-        }
-        w.end_object();
-        w.key("points").begin_array();
-        for p in s.points {
-            w.begin_array()
-                .int(p.ts.as_millis())
-                .number(p.value)
-                .end_array();
-        }
-        w.end_array();
-        w.end_object();
-    }
-    w.end_array();
-    w.end_object();
-    Response::json(200, w.finish())
+    Ok(Json(QueryResponse {
+        metric: metric.as_str().to_string(),
+        from: from.as_millis(),
+        to: to.as_millis(),
+        step: step_ms,
+        series,
+    }))
 }
 
-fn handle_self_metrics(state: &AppState) -> Response {
-    use crate::model::{Labels, MetricKind, SeriesKey};
+async fn get_self_metrics(State(state): State<Arc<AppState>>) -> Response {
+    use crate::model::{Labels, MetricKind, MetricMeta, SeriesKey};
     let stats = state.store.stats();
     let mut out = String::new();
-    let gauge = |name: &str, help: &str| {
+    let entries: [(&str, MetricKind, &str, f64); 5] = [
         (
-            MetricName::parse(name).expect("static name"),
-            MetricMeta {
-                kind: MetricKind::Gauge,
-                help: help.to_string(),
-            },
-        )
-    };
-    let counter = |name: &str, help: &str| {
-        (
-            MetricName::parse(name).expect("static name"),
-            MetricMeta {
-                kind: MetricKind::Counter,
-                help: help.to_string(),
-            },
-        )
-    };
-    let entries: [(_, f64); 5] = [
-        (
-            counter(
-                "rustmetrics_ingested_samples_total",
-                "Samples accepted into the store.",
-            ),
+            "rustmetrics_ingested_samples_total",
+            MetricKind::Counter,
+            "Samples accepted into the store.",
             stats.ingested_total as f64,
         ),
         (
-            counter(
-                "rustmetrics_dropped_samples_total",
-                "Samples dropped (out of order or older than retention).",
-            ),
+            "rustmetrics_dropped_samples_total",
+            MetricKind::Counter,
+            "Samples dropped (out of order or older than retention).",
             stats.dropped_total as f64,
         ),
         (
-            gauge("rustmetrics_series", "Live time series count."),
+            "rustmetrics_series",
+            MetricKind::Gauge,
+            "Live time series count.",
             stats.series_count as f64,
         ),
         (
-            gauge("rustmetrics_metrics", "Distinct metric names."),
+            "rustmetrics_metrics",
+            MetricKind::Gauge,
+            "Distinct metric names.",
             stats.metric_count as f64,
         ),
         (
-            counter("rustmetrics_http_requests_total", "HTTP requests handled."),
+            "rustmetrics_http_requests_total",
+            MetricKind::Counter,
+            "HTTP requests handled.",
             state.http_requests_total.load(Ordering::Relaxed) as f64,
         ),
     ];
-    for ((name, meta), value) in entries {
-        textfmt::encode_meta(&mut out, &name, &meta);
+    for (name_str, kind, help, value) in entries {
+        let name = MetricName::parse(name_str).expect("static name");
+        textfmt::encode_meta(
+            &mut out,
+            &name,
+            &MetricMeta {
+                kind,
+                help: help.to_string(),
+            },
+        );
         textfmt::encode_sample(
             &mut out,
             &SeriesKey {
@@ -238,37 +294,30 @@ fn handle_self_metrics(state: &AppState) -> Response {
             None,
         );
     }
-    Response::text(200, out)
+    ([("content-type", "text/plain; charset=utf-8")], out).into_response()
 }
 
-fn parse_metric_param(query: &QueryParams) -> Result<MetricName, Box<Response>> {
-    let raw = query
+fn parse_metric_param(params: &BTreeMap<String, String>) -> Result<MetricName, ApiError> {
+    let raw = params
         .get("metric")
-        .ok_or_else(|| Box::new(Response::json_error(400, "query: missing metric param")))?;
-    MetricName::parse(raw).map_err(|_| {
-        Box::new(Response::json_error(
-            400,
-            &format!("query: invalid metric name {raw:?}"),
-        ))
-    })
+        .ok_or_else(|| ApiError::bad_request("query: missing metric param"))?;
+    MetricName::parse(raw)
+        .map_err(|_| ApiError::bad_request(format!("query: invalid metric name {raw:?}")))
 }
 
 fn parse_ts_param(
-    query: &QueryParams,
+    params: &BTreeMap<String, String>,
     key: &str,
     default: TimestampMs,
-) -> Result<TimestampMs, Box<Response>> {
-    match query.get(key) {
+) -> Result<TimestampMs, ApiError> {
+    match params.get(key).map(String::as_str) {
         None | Some("") => Ok(default),
         Some(raw) => raw
             .parse::<i64>()
             .ok()
             .and_then(|ms| TimestampMs::new(ms).ok())
             .ok_or_else(|| {
-                Box::new(Response::json_error(
-                    400,
-                    &format!("query: invalid {key} timestamp {raw:?}"),
-                ))
+                ApiError::bad_request(format!("query: invalid {key} timestamp {raw:?}"))
             }),
     }
 }
@@ -277,121 +326,137 @@ fn parse_ts_param(
 mod tests {
     use super::*;
     use crate::storage::DEFAULT_MAX_POINTS;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
-    fn state() -> AppState {
-        AppState::new(Arc::new(MetricStore::new(i64::MAX / 2, DEFAULT_MAX_POINTS)))
+    fn app() -> Router {
+        let state = Arc::new(AppState::new(Arc::new(MetricStore::new(
+            i64::MAX / 2,
+            DEFAULT_MAX_POINTS,
+        ))));
+        router(state)
     }
 
-    fn get(path_query: &str) -> Request {
-        let (path, query) = match path_query.split_once('?') {
-            Some((p, q)) => (p.to_string(), QueryParams::parse(q).unwrap()),
-            None => (path_query.to_string(), QueryParams::default()),
-        };
-        Request {
-            method: Method::Get,
-            path,
-            query,
-            body: Vec::new(),
-        }
+    async fn send(app: &Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
-    fn post(path: &str, body: &str) -> Request {
-        Request {
-            method: Method::Post,
-            path: path.to_string(),
-            query: QueryParams::default(),
-            body: body.as_bytes().to_vec(),
-        }
+    async fn get(app: &Router, uri: &str) -> (StatusCode, String) {
+        send(app, Request::get(uri).body(Body::empty()).unwrap()).await
     }
 
-    fn body_str(r: &Response) -> String {
-        String::from_utf8(r.body.clone()).unwrap()
+    async fn post(app: &Router, uri: &str, body: &str) -> (StatusCode, String) {
+        send(
+            app,
+            Request::post(uri)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
     }
 
-    #[test]
-    fn push_then_list_and_query() {
-        let st = state();
+    #[tokio::test]
+    async fn push_then_list_and_query() {
+        let app = app();
         let now_ms = TimestampMs::now().as_millis();
         let push_body = format!(
             "# TYPE reqs counter\nreqs{{job=\"api\"}} 7 {now_ms}\nreqs{{job=\"web\"}} 3 {now_ms}\n"
         );
-        let r = handle(&st, post("/api/push", &push_body));
-        assert_eq!(r.status, 204, "{}", body_str(&r));
+        let (status, body) = post(&app, "/api/push", &push_body).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
-        let r = handle(&st, get("/api/metrics"));
-        assert_eq!(r.status, 200);
-        let b = body_str(&r);
-        assert!(b.contains(r#""name":"reqs""#), "{b}");
-        assert!(b.contains(r#""kind":"counter""#), "{b}");
-        assert!(b.contains(r#""series":2"#), "{b}");
+        let (status, body) = get(&app, "/api/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""name":"reqs""#), "{body}");
+        assert!(body.contains(r#""kind":"counter""#), "{body}");
+        assert!(body.contains(r#""series":2"#), "{body}");
 
-        let r = handle(&st, get("/api/query?metric=reqs&label.job=api"));
-        assert_eq!(r.status, 200);
-        let b = body_str(&r);
-        assert!(b.contains(r#""labels":{"job":"api"}"#), "{b}");
-        assert!(b.contains(&format!("[{now_ms},7]")), "{b}");
-        assert!(!b.contains(r#""job":"web""#), "{b}");
+        let (status, body) = get(&app, "/api/query?metric=reqs&label.job=api").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""labels":{"job":"api"}"#), "{body}");
+        assert!(body.contains(&format!("[{now_ms},7.0]")), "{body}");
+        assert!(!body.contains(r#""job":"web""#), "{body}");
     }
 
-    #[test]
-    fn push_error_includes_line() {
-        let st = state();
-        let r = handle(&st, post("/api/push", "ok 1\n9bad 2\n"));
-        assert_eq!(r.status, 400);
-        assert!(body_str(&r).contains("line 2"), "{}", body_str(&r));
+    #[tokio::test]
+    async fn push_error_includes_line() {
+        let app = app();
+        let (status, body) = post(&app, "/api/push", "ok 1\n9bad 2\n").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("line 2"), "{body}");
     }
 
-    #[test]
-    fn labels_endpoint() {
-        let st = state();
-        handle(
-            &st,
-            post("/api/push", "m{a=\"1\",b=\"x\"} 1\nm{a=\"2\"} 1\n"),
+    #[tokio::test]
+    async fn labels_endpoint() {
+        let app = app();
+        post(&app, "/api/push", "m{a=\"1\",b=\"x\"} 1\nm{a=\"2\"} 1\n").await;
+        let (status, body) = get(&app, "/api/labels?metric=m").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""a":["1","2"]"#), "{body}");
+        assert!(body.contains(r#""b":["x"]"#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn query_param_validation() {
+        let app = app();
+        for uri in [
+            "/api/query",
+            "/api/query?metric=9bad",
+            "/api/query?metric=m&from=abc",
+            "/api/query?metric=m&step=0",
+            "/api/query?metric=m&from=2000&to=1000",
+            "/api/query?metric=m&label.9x=1",
+        ] {
+            let (status, body) = get(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+            assert!(body.contains("error"), "{uri} -> {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_finite_points_are_null() {
+        let app = app();
+        let now_ms = TimestampMs::now().as_millis();
+        post(&app, "/api/push", &format!("m NaN {now_ms}\n")).await;
+        let (status, body) = get(&app, "/api/query?metric=m").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(&format!("[{now_ms},null]")), "{body}");
+    }
+
+    #[tokio::test]
+    async fn self_metrics_and_dashboard() {
+        let app = app();
+        post(&app, "/api/push", "m 1\n").await;
+        let (status, body) = get(&app, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("rustmetrics_ingested_samples_total 1"),
+            "{body}"
         );
-        let r = handle(&st, get("/api/labels?metric=m"));
-        assert_eq!(r.status, 200);
-        let b = body_str(&r);
-        assert!(b.contains(r#""a":["1","2"]"#), "{b}");
-        assert!(b.contains(r#""b":["x"]"#), "{b}");
+        assert!(body.contains("# TYPE rustmetrics_series gauge"), "{body}");
+
+        let (status, body) = get(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<html"));
     }
 
-    #[test]
-    fn query_param_validation() {
-        let st = state();
-        assert_eq!(handle(&st, get("/api/query")).status, 400);
-        assert_eq!(handle(&st, get("/api/query?metric=9bad")).status, 400);
-        assert_eq!(handle(&st, get("/api/query?metric=m&from=abc")).status, 400);
-        assert_eq!(handle(&st, get("/api/query?metric=m&step=0")).status, 400);
+    #[tokio::test]
+    async fn unknown_route_and_wrong_method() {
+        let app = app();
+        assert_eq!(get(&app, "/nope").await.0, StatusCode::NOT_FOUND);
         assert_eq!(
-            handle(&st, get("/api/query?metric=m&from=2000&to=1000")).status,
-            400
+            post(&app, "/api/query", "").await.0,
+            StatusCode::METHOD_NOT_ALLOWED
         );
         assert_eq!(
-            handle(&st, get("/api/query?metric=m&label.9x=1")).status,
-            400
+            get(&app, "/api/push").await.0,
+            StatusCode::METHOD_NOT_ALLOWED
         );
-    }
-
-    #[test]
-    fn self_metrics_and_dashboard() {
-        let st = state();
-        handle(&st, post("/api/push", "m 1\n"));
-        let r = handle(&st, get("/metrics"));
-        assert_eq!(r.status, 200);
-        let b = body_str(&r);
-        assert!(b.contains("rustmetrics_ingested_samples_total 1"), "{b}");
-        assert!(b.contains("# TYPE rustmetrics_series gauge"), "{b}");
-
-        let r = handle(&st, get("/"));
-        assert_eq!(r.status, 200);
-        assert!(body_str(&r).contains("<html"));
-    }
-
-    #[test]
-    fn unknown_route_and_wrong_method() {
-        let st = state();
-        assert_eq!(handle(&st, get("/nope")).status, 404);
-        assert_eq!(handle(&st, post("/api/query", "")).status, 405);
-        assert_eq!(handle(&st, get("/api/push")).status, 405);
     }
 }

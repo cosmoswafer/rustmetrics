@@ -1,6 +1,6 @@
 # rustmetrics
 
-A minimalist, lightweight, zero-config metrics collection & dashboard system written in Rust — a zero-dependency clone of Prometheus + Grafana in one binary. Collects metrics and renders dashboards.
+A minimalist, lightweight, zero-config metrics collection & dashboard system written in Rust — a small Prometheus + Grafana clone in one binary, built on tokio/axum/reqwest. Collects metrics and renders dashboards.
 
 ## Quick start
 

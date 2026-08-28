@@ -1,27 +1,18 @@
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::thread;
 
-use rustmetrics::api::{self, AppState};
-use rustmetrics::config::{Config, ConfigError};
-use rustmetrics::http::server;
+use clap::Parser;
+
+use rustmetrics::api::AppState;
+use rustmetrics::config::Config;
 use rustmetrics::model::TimestampMs;
 use rustmetrics::scraper;
 use rustmetrics::snapshot;
 use rustmetrics::storage::{MetricStore, DEFAULT_MAX_POINTS};
 
-fn main() -> ExitCode {
-    let config = match Config::parse(std::env::args().skip(1)) {
-        Ok(c) => c,
-        Err(ConfigError::HelpRequested) => {
-            print!("{}", rustmetrics::config::USAGE);
-            return ExitCode::SUCCESS;
-        }
-        Err(e) => {
-            eprintln!("error: {e}\n\n{}", rustmetrics::config::USAGE);
-            return ExitCode::from(2);
-        }
-    };
+#[tokio::main]
+async fn main() -> ExitCode {
+    let config = Config::parse();
 
     let store = Arc::new(MetricStore::new(
         config.retention.as_millis() as i64,
@@ -43,28 +34,35 @@ fn main() -> ExitCode {
         let snap_store = Arc::clone(&store);
         let data_dir = config.data_dir.clone();
         let interval = config.snapshot_interval;
-        thread::spawn(move || loop {
-            thread::sleep(interval);
-            snap_store.prune(TimestampMs::now());
-            if let Err(e) = snapshot::save(&data_dir, &snap_store.dump()) {
-                eprintln!("warn: snapshot save failed: {e}");
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                snap_store.prune(TimestampMs::now());
+                if let Err(e) = snapshot::save(&data_dir, &snap_store.dump()) {
+                    eprintln!("warn: snapshot save failed: {e}");
+                }
             }
         });
     }
 
     if !config.scrape_targets.is_empty() {
-        let scrape_store = Arc::clone(&store);
-        let targets = config.scrape_targets.clone();
-        let interval = config.scrape_interval;
         println!(
             "scraping {} target(s) every {}s",
-            targets.len(),
-            interval.as_secs()
+            config.scrape_targets.len(),
+            config.scrape_interval.as_secs()
         );
-        thread::spawn(move || scraper::run(scrape_store, targets, interval));
+        tokio::spawn(scraper::run(
+            Arc::clone(&store),
+            scraper::client(),
+            config.scrape_targets.clone(),
+            config.scrape_interval,
+        ));
     }
 
-    let listener = match std::net::TcpListener::bind(config.listen) {
+    let listener = match tokio::net::TcpListener::bind(config.listen).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: cannot listen on {}: {e}", config.listen);
@@ -75,6 +73,22 @@ fn main() -> ExitCode {
     println!("  dashboard  http://{}/", config.listen);
     println!("  push       POST http://{}/api/push", config.listen);
 
-    let state = Arc::new(AppState::new(store));
-    server::serve(listener, Arc::new(move |req| api::handle(&state, req)))
+    let app = rustmetrics::api::router(Arc::new(AppState::new(Arc::clone(&store))));
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("shutting down");
+        })
+        .await;
+    if let Err(e) = served {
+        eprintln!("error: server failed: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    if config.snapshots_enabled {
+        if let Err(e) = snapshot::save(&config.data_dir, &store.dump()) {
+            eprintln!("warn: final snapshot save failed: {e}");
+        }
+    }
+    ExitCode::SUCCESS
 }
