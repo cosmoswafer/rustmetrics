@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod dashboard;
+pub mod llamacpp;
 pub mod model;
 pub mod scraper;
 pub mod snapshot;

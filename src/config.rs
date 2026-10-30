@@ -4,13 +4,17 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use reqwest::Url;
 
 /// Minimalist metrics collection & dashboard in one binary.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "rustmetrics", version)]
 pub struct Config {
+    /// Monitor a llama.cpp server with live TUI charts
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Listen address
     #[arg(long, default_value = "127.0.0.1:9090")]
     pub listen: SocketAddr,
@@ -38,6 +42,13 @@ pub struct Config {
     /// Disable snapshot persistence
     #[arg(long = "no-snapshot", action = clap::ArgAction::SetFalse)]
     pub snapshots_enabled: bool,
+}
+
+/// Subcommands; none means run the dashboard server.
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Collect metrics from a llama.cpp server and display them as a live TUI
+    Llamacpp(crate::llamacpp::LlamaArgs),
 }
 
 fn parse_scrape_url(s: &str) -> Result<Url, String> {
@@ -75,6 +86,7 @@ mod tests {
     #[test]
     fn defaults_with_no_args() {
         let cfg = parse(&[]).unwrap();
+        assert!(cfg.command.is_none());
         assert_eq!(cfg.listen, "127.0.0.1:9090".parse().unwrap());
         assert!(cfg.scrape_targets.is_empty());
         assert_eq!(cfg.scrape_interval, Duration::from_secs(15));
@@ -121,5 +133,56 @@ mod tests {
         assert!(parse(&["--scrape", "ftp://x/"]).is_err());
         assert!(parse(&["--scrape", "https://x/metrics"]).is_err());
         assert!(parse(&["--retention", "0"]).is_err());
+    }
+
+    #[test]
+    fn parses_llamacpp_subcommand() {
+        let cfg = parse(&[
+            "llamacpp",
+            "--url",
+            "http://localhost:2464",
+            "--interval",
+            "1",
+            "--probe-tokens",
+            "32",
+            "--model",
+            "lfm25",
+            "--window",
+            "60",
+            "--no-probe",
+            "--once",
+        ])
+        .unwrap();
+        let Some(Command::Llamacpp(args)) = cfg.command else {
+            panic!("expected llamacpp subcommand");
+        };
+        assert_eq!(args.url, "http://localhost:2464");
+        assert_eq!(args.interval, 1.0);
+        assert_eq!(args.probe_tokens, 32);
+        assert_eq!(args.model.as_deref(), Some("lfm25"));
+        assert_eq!(args.window, 60.0);
+        assert!(!args.probe);
+        assert!(args.once);
+    }
+
+    #[test]
+    fn llamacpp_defaults() {
+        let cfg = parse(&["llamacpp"]).unwrap();
+        let Some(Command::Llamacpp(args)) = cfg.command else {
+            panic!("expected llamacpp subcommand");
+        };
+        assert_eq!(args.url, "http://127.0.0.1:8080");
+        assert_eq!(args.interval, 2.0);
+        assert!(args.probe);
+        assert_eq!(args.probe_tokens, 16);
+        assert_eq!(args.window, 300.0);
+        assert!(!args.once);
+    }
+
+    #[test]
+    fn rejects_bad_llamacpp_input() {
+        assert!(parse(&["llamacpp", "--url", "ftp://x/"]).is_err());
+        assert!(parse(&["llamacpp", "--interval", "0"]).is_err());
+        assert!(parse(&["llamacpp", "--window", "0.05"]).is_err());
     }
 }

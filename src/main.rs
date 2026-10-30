@@ -14,6 +14,11 @@ use rustmetrics::storage::{MetricStore, DEFAULT_MAX_POINTS};
 async fn main() -> ExitCode {
     let config = Config::parse();
 
+    // `rustmetrics llamacpp ...` runs the standalone TUI monitor instead
+    if let Some(rustmetrics::config::Command::Llamacpp(args)) = config.command {
+        return rustmetrics::llamacpp::run(args).await;
+    }
+
     let store = Arc::new(MetricStore::new(
         config.retention.as_millis() as i64,
         DEFAULT_MAX_POINTS,
