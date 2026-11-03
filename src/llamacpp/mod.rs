@@ -37,12 +37,11 @@ pub struct LlamaArgs {
     #[arg(long, value_name = "SECS", default_value = "2", value_parser = parse_secs_f64)]
     pub interval: f64,
 
-    /// Disable the one-shot generation probe used with --once
-
+    /// Disable the streaming generation probe used with --once
     #[arg(long = "no-probe", action = ArgAction::SetFalse)]
     pub probe: bool,
 
-    /// Tokens to generate for the one-shot --once probe
+    /// Tokens to generate for the streaming --once probe
     #[arg(long, value_name = "N", default_value_t = 16)]
     pub probe_tokens: u32,
 
@@ -152,15 +151,21 @@ async fn once(collector: &Arc<Collector>, state: &Arc<Mutex<State>>) -> ExitCode
     if let Some(pr) = &g.last_probe {
         match &pr.error {
             Some(e) => println!("  probe    {} failed: {e}", pr.model),
-            None => println!(
-                "  probe    {}: gen {} tok/s · prompt {} tok/s · wall {}ms · {} gen tok · cache {}",
-                pr.model,
-                tui::fmt_num(pr.gen_tps),
-                tui::fmt_num(pr.prompt_tps),
-                pr.wall_ms as u64,
-                pr.gen_n,
-                pr.cache_n
-            ),
+            None => {
+                let ttft = pr
+                    .ttft_ms
+                    .map(|ms| format!("{ms:.0}ms"))
+                    .unwrap_or_else(|| "n/a (no streamed token)".to_string());
+                println!(
+                    "  probe    {}: TTFT {ttft} · gen {} tok/s · prompt {} tok/s · wall {}ms · {} gen tok · cache {}",
+                    pr.model,
+                    tui::fmt_num(pr.gen_tps),
+                    tui::fmt_num(pr.prompt_tps),
+                    pr.wall_ms as u64,
+                    pr.gen_n,
+                    pr.cache_n
+                );
+            }
         }
         println!("  probes   {} ok / {} err", g.probes_ok, g.probes_err);
     } else {

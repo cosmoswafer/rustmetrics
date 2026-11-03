@@ -19,10 +19,10 @@ That's it. If the server is reachable you get a live dashboard:
 │ ◆ RUSTMETRICS / LLAMA.CPP                 ● LIVE  SESSION 0m06s            │
 │ URL http://localhost:2464 · router         10 models, 1 loaded             │
 ╰────────────────────────────────────────────────────────────────────────────╯
-╭ GENERATION ────────╮ ╭ PROMPT ───────────╮ ╭ KV CACHE ─────────╮ ╭ CONTEXT ─╮
+╭ DECODE ────────────╮ ╭ PREFILL ──────────╮ ╭ KV CACHE ─────────╮ ╭ CONTEXT ─╮
 │ 103.9 tok/s      ↗ │ │ 79.1 tok/s      → │ │ 304.1k tokens   → │ │ 0.10 % │
 ╰────────────────────╯ ╰───────────────────╯ ╰───────────────────╯ ╰──────────╯
-╭ active model ─────╮ ╭ generation / bonsai27 ─────────────────────────────────╮
+╭ active model ─────╮ ╭ decode / bonsai27 ────────────────────────────────────╮
 │ ● bonsai27 LOADED │ │ 200.0 ··············································· │
 │ CTX 65.5k         │ │ 100.0 ▃▄▅▆▇███████████████████████████████████████████ │
 ╰───────────────────╯ ╰────────────────────────────────────────────────────────╯
@@ -60,14 +60,15 @@ Both server shapes are supported and auto-detected:
 
 ## What you see
 
-- **live KPI cards** — current generation, prompt, KV cache and context values,
-  with averages, peaks, trend arrows and miniature history plots.
+- **live KPI cards** — current decode, prefill, KV cache and context values,
+  with averages, peaks and trend arrows.
 - **active model panel** — the watched model's load state, context size, HF
   repository and runtime metadata. `tab` cycles only active/loaded models.
 - **slot activity panel** — busy/idle slots, per-slot context meters, token
   counts and KV cache hits.
-- **filled charts** — full-width generation and prompt throughput plus context
-  histories, with automatic scaling, axes and sample counts.
+- **filled charts** — full-width decode and prefill throughput plus context
+  histories, with automatic scaling, clean axes and sample counts. Prefill uses
+  a logarithmic scale so smaller bursts remain visible alongside large spikes.
 - **Prometheus grid** — when `/metrics` is enabled, llama.cpp's own series are
   listed first in a compact multi-column panel.
 - **request activity + footer** — real processing/deferred requests, decode
@@ -85,16 +86,25 @@ Both server shapes are supported and auto-detected:
 
 ## Where the numbers come from
 
-1. **Prometheus gauges** — `/metrics?model=...` supplies the server's
-   instantaneous `llamacpp:predicted_tokens_seconds` and
-   `llamacpp:prompt_tokens_seconds` values on every successful poll.
-2. **Passive slot deltas** — between consecutive `/slots?model=...` snapshots,
+1. **Passive slot deltas** — between consecutive `/slots?model=...` snapshots,
    the monitor measures changes in `n_prompt_tokens_processed` and
-   `next_token.n_decoded` for the same `id_task`. This keeps throughput charts
-   moving when the metrics proxy fails, using real work from OpenCode or any
-   other client. New tasks and counter resets establish a fresh baseline and
-   never produce negative or cross-request rates. Slot and metrics requests run
+   `next_token.n_decoded` for the same `id_task`. Both the documented object
+   shape and the current one-element `next_token` array are accepted. New tasks
+   and counter resets establish a fresh baseline and never produce negative or
+   cross-request rates.
+2. **Prometheus fallback** — `/metrics?model=...` supplies an initial estimate
+   and a fallback when slot deltas are unavailable. Official llama.cpp defines
+   `llamacpp:predicted_tokens_seconds` and `llamacpp:prompt_tokens_seconds` as
+   averages between scrapes, resets their buckets on every scrape, and may not
+   flush generation statistics until a request finishes. They are therefore not
+   preferred over live slot counters. Slot and metrics requests run
    concurrently, and a busy slot endpoint cannot stall Prometheus updates.
+3. **`--once` streaming probe** — unless `--no-probe` is set, the tiny generation
+   request measures client-observed **time to first token (TTFT)** from request
+   start to the first non-empty content, reasoning, or tool-call delta. Role-only
+   and other metadata chunks do not count. Total wall time and the final server
+   usage/timings are reported alongside it. Exact TTFT is not available from
+   passive `/slots` polling.
 
 The TUI is strictly read-only: it sends **no chat, completion, generation, or
 model-loading requests**. It only polls `/health`, `/props`, `/v1/models`,
@@ -127,7 +137,8 @@ rustmetrics llamacpp --once --no-probe --url http://localhost:2464
 ```
 
 `--once` exits non-zero if the server is down, so it works as a health probe
-in scripts/cron.
+in scripts/cron. Its default streaming generation probe prints TTFT and total
+wall time; pass `--no-probe` when no inference request should be sent.
 
 ## Troubleshooting
 

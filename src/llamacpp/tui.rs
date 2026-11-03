@@ -6,7 +6,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Sparkline, Table, Wrap};
+use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::llamacpp::collect::{Series, SlotInfo, State};
@@ -166,7 +166,7 @@ pub fn draw(f: &mut Frame, st: &State, theme: Theme) {
     let show_kpis = f.area().width >= 92 && f.area().height >= 25;
     let mut constraints = vec![Constraint::Length(4)];
     if show_kpis {
-        constraints.push(Constraint::Length(5));
+        constraints.push(Constraint::Length(4));
     }
     constraints.extend([Constraint::Min(3), Constraint::Length(1)]);
     let areas = Layout::vertical(constraints).split(f.area());
@@ -391,7 +391,7 @@ fn draw_kpis(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
         f,
         cards[0],
         st.series.get(&format!("gen_tps/{focus}")),
-        "GENERATION",
+        "DECODE",
         "tok/s",
         p.cyan,
         p,
@@ -400,7 +400,7 @@ fn draw_kpis(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
         f,
         cards[1],
         st.series.get(&format!("prompt_tps/{focus}")),
-        "PROMPT",
+        "PREFILL",
         "tok/s",
         p.green,
         p,
@@ -438,15 +438,10 @@ fn metric_card(
     let block = panel(title(name, accent), accent, p);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if inner.height < 3 {
+    if inner.height < 2 {
         return;
     }
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
 
     let value = stats.map(|s| fmt_num(s.now)).unwrap_or_else(|| "—".into());
     let trend = stats.map(|s| s.trend).unwrap_or(Trend::Unknown);
@@ -470,32 +465,13 @@ fn metric_card(
         top[1],
     );
 
-    if series.is_some() {
-        // Preserve small percentages and sub-token changes in the u64-based
-        // sparkline widget instead of rounding them all the way to zero.
-        let (data, max) = spark_data_scaled(series, rows[1].width as usize, 100.0);
-        let spark_max = nice_max(max.unwrap_or(0.0)) * 100.0;
-        f.render_widget(
-            Sparkline::default()
-                .data(&data)
-                .max(spark_max as u64)
-                .style(Style::new().fg(accent).bg(p.surface)),
-            rows[1],
-        );
-    } else {
-        f.render_widget(
-            Paragraph::new(Span::styled("waiting for samples", Style::new().fg(p.dim))),
-            rows[1],
-        );
-    }
-
     let summary = match stats {
         Some(s) => format!("avg {}  ·  peak {}", fmt_num(s.avg), fmt_num(s.peak)),
         None => "avg —  ·  peak —".to_string(),
     };
     f.render_widget(
         Paragraph::new(Span::styled(summary, Style::new().fg(p.muted))),
-        rows[2],
+        rows[1],
     );
 }
 
@@ -696,13 +672,13 @@ fn draw_compact_model(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
         columns[1],
     );
 
-    let generation = st
+    let decode = st
         .series
         .get(&format!("gen_tps/{name}"))
         .and_then(|series| series.last())
         .map(|sample| fmt_num(sample.v))
         .unwrap_or_else(|| "—".into());
-    let prompt = st
+    let prefill = st
         .series
         .get(&format!("prompt_tps/{name}"))
         .and_then(|series| series.last())
@@ -710,11 +686,11 @@ fn draw_compact_model(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
         .unwrap_or_else(|| "—".into());
     let activity_lines = vec![
         Line::from(Span::styled(
-            format!("{generation} tok/s"),
+            format!("{decode} decode tok/s"),
             Style::new().fg(p.cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            format!("{prompt} prompt tok/s"),
+            format!("{prefill} prefill tok/s"),
             Style::new().fg(p.green),
         )),
         Line::from(Span::styled("PASSIVE THROUGHPUT", Style::new().fg(p.dim))),
@@ -909,7 +885,7 @@ fn draw_session(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
             Style::new().fg(p.amber),
         )),
         Line::from(Span::styled(
-            "no inference requests sent",
+            "no requests sent by monitor",
             Style::new().fg(p.green),
         )),
         Line::from(Span::styled(source, Style::new().fg(p.dim))),
@@ -920,6 +896,29 @@ fn draw_session(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
 // ---------------------------------------------------------------------------
 // charts
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartScale {
+    Linear,
+    Log,
+}
+
+impl ChartScale {
+    fn ratio(self, value: f64, max: f64) -> f64 {
+        let value = value.max(0.0);
+        match self {
+            Self::Linear => value / max.max(f64::EPSILON),
+            Self::Log => value.ln_1p() / max.max(f64::EPSILON).ln_1p(),
+        }
+        .clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChartStyle {
+    accent: Color,
+    scale: ChartScale,
+}
 
 fn draw_charts(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let focus = st.focus_model().map(|m| m.name.clone()).unwrap_or_default();
@@ -950,18 +949,24 @@ fn draw_charts(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
         f,
         areas[0],
         st.series.get(&format!("gen_tps/{focus}")),
-        &format!("generation / {focus}"),
+        &format!("decode / {focus}"),
         "tok/s",
-        p.cyan,
+        ChartStyle {
+            accent: p.cyan,
+            scale: ChartScale::Linear,
+        },
         p,
     );
     area_chart(
         f,
         areas[1],
         st.series.get(&format!("prompt_tps/{focus}")),
-        "prompt throughput",
+        &format!("prefill / {focus}"),
         "tok/s",
-        p.green,
+        ChartStyle {
+            accent: p.green,
+            scale: ChartScale::Log,
+        },
         p,
     );
 
@@ -975,7 +980,10 @@ fn draw_charts(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
             st.series.get(&format!("ctx_pct/{focus}")),
             "context window",
             "%",
-            p.violet,
+            ChartStyle {
+                accent: p.violet,
+                scale: ChartScale::Linear,
+            },
             p,
         );
         draw_prom_table(f, bottom[1], st, p);
@@ -986,7 +994,10 @@ fn draw_charts(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
             st.series.get(&format!("ctx_pct/{focus}")),
             "context window",
             "%",
-            p.violet,
+            ChartStyle {
+                accent: p.violet,
+                scale: ChartScale::Linear,
+            },
             p,
         );
     }
@@ -998,9 +1009,10 @@ fn area_chart(
     series: Option<&Series>,
     name: &str,
     unit: &str,
-    accent: Color,
+    style: ChartStyle,
     p: &Palette,
 ) {
+    let ChartStyle { accent, scale } = style;
     if area.is_empty() {
         return;
     }
@@ -1045,7 +1057,7 @@ fn area_chart(
 
     let values = series.map(Series::values).unwrap_or_default();
     let max = nice_max(stats.map(|s| s.peak).unwrap_or(0.0));
-    draw_grid(f, inner, graph, max, axis_width, p);
+    draw_grid(f, inner, graph, max, axis_width, scale, p);
 
     if values.is_empty() {
         let message = "○  WAITING FOR SAMPLES";
@@ -1060,7 +1072,7 @@ fn area_chart(
         );
     } else {
         let data = resample_series(&values, graph.width as usize);
-        draw_area(f, graph, &data, max, accent, p);
+        draw_area(f, graph, &data, max, accent, scale, p);
     }
 
     if time_height > 0 {
@@ -1069,7 +1081,10 @@ fn area_chart(
         f.buffer_mut()
             .set_stringn(graph.x, y, "older", graph.width as usize, style);
         if graph.width > 16 {
-            let sample_label = format!("{} samples", values.len());
+            let sample_label = match scale {
+                ChartScale::Linear => format!("{} samples", values.len()),
+                ChartScale::Log => format!("log scale · {} samples", values.len()),
+            };
             let x = graph.x + graph.width.saturating_sub(sample_label.len() as u16) / 2;
             f.buffer_mut()
                 .set_stringn(x, y, sample_label, graph.width as usize, style);
@@ -1081,12 +1096,22 @@ fn area_chart(
     }
 }
 
-fn draw_grid(f: &mut Frame, inner: Rect, graph: Rect, max: f64, axis_width: u16, p: &Palette) {
+fn draw_grid(
+    f: &mut Frame,
+    inner: Rect,
+    graph: Rect,
+    max: f64,
+    axis_width: u16,
+    scale: ChartScale,
+    p: &Palette,
+) {
     let buf = f.buffer_mut();
-    for y in graph.y..graph.bottom() {
+    let ticks = chart_ticks(graph, max, scale);
+    for &(y, value) in &ticks {
+        let symbol = if value == 0.0 { "─" } else { "┄" };
         for x in graph.x..graph.right() {
             buf[(x, y)]
-                .set_symbol("·")
+                .set_symbol(symbol)
                 .set_style(Style::new().fg(p.grid).bg(p.surface));
         }
     }
@@ -1094,12 +1119,7 @@ fn draw_grid(f: &mut Frame, inner: Rect, graph: Rect, max: f64, axis_width: u16,
         return;
     }
 
-    let mut labels = vec![(graph.y, max)];
-    if graph.height >= 3 {
-        labels.push((graph.y + (graph.height - 1) / 2, max / 2.0));
-    }
-    labels.push((graph.bottom().saturating_sub(1), 0.0));
-    for (y, value) in labels {
+    for (y, value) in ticks {
         let label = format!("{:>5}", fmt_num(value));
         buf.set_stringn(
             inner.x,
@@ -1111,7 +1131,46 @@ fn draw_grid(f: &mut Frame, inner: Rect, graph: Rect, max: f64, axis_width: u16,
     }
 }
 
-fn draw_area(f: &mut Frame, area: Rect, values: &[f64], max: f64, accent: Color, p: &Palette) {
+fn chart_ticks(graph: Rect, max: f64, scale: ChartScale) -> Vec<(u16, f64)> {
+    let bottom = graph.bottom().saturating_sub(1);
+    let mut ticks = vec![(graph.y, max), (bottom, 0.0)];
+    if graph.height < 3 {
+        return ticks;
+    }
+
+    match scale {
+        ChartScale::Linear => {
+            ticks.push((graph.y + (graph.height - 1) / 2, max / 2.0));
+        }
+        ChartScale::Log => {
+            let mut value = 1.0;
+            while value < max {
+                let offset = (scale.ratio(value, max) * (graph.height - 1) as f64).round() as u16;
+                let y = bottom.saturating_sub(offset);
+                if y > graph.y && y < bottom {
+                    if let Some(tick) = ticks.iter_mut().find(|(tick_y, _)| *tick_y == y) {
+                        tick.1 = tick.1.max(value);
+                    } else {
+                        ticks.push((y, value));
+                    }
+                }
+                value *= 10.0;
+            }
+        }
+    }
+    ticks.sort_by_key(|(y, _)| *y);
+    ticks
+}
+
+fn draw_area(
+    f: &mut Frame,
+    area: Rect,
+    values: &[f64],
+    max: f64,
+    accent: Color,
+    scale: ChartScale,
+    p: &Palette,
+) {
     let buf = f.buffer_mut();
     let height = area.height as usize;
     for (column, value) in values.iter().enumerate() {
@@ -1119,7 +1178,7 @@ fn draw_area(f: &mut Frame, area: Rect, values: &[f64], max: f64, accent: Color,
         if x >= area.right() {
             break;
         }
-        let units = (value.max(0.0) / max.max(f64::EPSILON) * (height * 8) as f64)
+        let units = (scale.ratio(*value, max) * (height * 8) as f64)
             .round()
             .clamp(0.0, (height * 8) as f64) as usize;
         let full_rows = units / 8;
@@ -1282,23 +1341,6 @@ fn draw_prom_table(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
 // formatting helpers
 // ---------------------------------------------------------------------------
 
-/// Tail of a series as scaled u64 values, newest last.
-fn spark_data_scaled(series: Option<&Series>, width: usize, scale: f64) -> (Vec<u64>, Option<f64>) {
-    let Some(series) = series else {
-        return (Vec::new(), None);
-    };
-    let max = series.max();
-    let data: Vec<u64> = series
-        .values()
-        .into_iter()
-        .rev()
-        .take(width)
-        .rev()
-        .map(|value| (value * scale).round().max(0.0) as u64)
-        .collect();
-    (data, max)
-}
-
 /// Compact number formatting for chart titles.
 pub fn fmt_num(value: f64) -> String {
     let absolute = value.abs();
@@ -1325,22 +1367,17 @@ fn fmt_count(value: u64) -> String {
     }
 }
 
-/// Round an axis maximum up to a 1/2/5×10^k value.
+/// Round an axis maximum to a nearby readable value without excessive headroom.
 pub fn nice_max(value: f64) -> f64 {
     if value <= 0.0 {
         return 1.0;
     }
     let base = 10f64.powf(value.log10().floor());
     let mantissa = value / base;
-    let nice = if mantissa <= 1.0 {
-        1.0
-    } else if mantissa <= 2.0 {
-        2.0
-    } else if mantissa <= 5.0 {
-        5.0
-    } else {
-        10.0
-    };
+    let nice = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+        .into_iter()
+        .find(|step| mantissa <= *step)
+        .unwrap_or(10.0);
     nice * base
 }
 
@@ -1450,14 +1487,14 @@ mod tests {
         assert!(screen.contains("bonsai27"), "{screen}");
         assert!(screen.contains("slot activity"), "{screen}");
         assert!(screen.contains("1/1 busy"), "{screen}");
-        assert!(screen.contains("GENERATION"), "{screen}");
-        assert!(screen.contains("PROMPT"), "{screen}");
+        assert!(screen.contains("DECODE"), "{screen}");
+        assert!(screen.contains("PREFILL"), "{screen}");
         assert!(screen.contains("KV CACHE"), "{screen}");
         assert!(screen.contains("CONTEXT"), "{screen}");
-        assert!(screen.contains("generation / bonsai27"), "{screen}");
+        assert!(screen.contains("decode / bonsai27"), "{screen}");
         assert!(screen.contains("context window"), "{screen}");
         assert!(screen.contains("request activity"), "{screen}");
-        assert!(screen.contains("no inference requests sent"), "{screen}");
+        assert!(screen.contains("no requests sent by monitor"), "{screen}");
         assert!(screen.contains("t light"), "{screen}");
         assert!(screen.contains("q quit"), "{screen}");
         assert!(screen.contains("passive"), "{screen}");
@@ -1528,8 +1565,8 @@ mod tests {
     fn compact_layout_still_renders_charts() {
         let screen = render_at(&sample_state(), 72, 28);
         assert!(screen.contains("active model"), "{screen}");
-        assert!(screen.contains("generation / bonsai27"), "{screen}");
-        assert!(screen.contains("prompt throughput"), "{screen}");
+        assert!(screen.contains("decode / bonsai27"), "{screen}");
+        assert!(screen.contains("prefill / bonsai27"), "{screen}");
         assert!(!screen.contains("busy slots"), "{screen}");
     }
 
@@ -1544,13 +1581,29 @@ mod tests {
     }
 
     #[test]
+    fn log_scale_preserves_smaller_prefill_bursts() {
+        let linear = ChartScale::Linear.ratio(100.0, 5000.0);
+        let logarithmic = ChartScale::Log.ratio(100.0, 5000.0);
+        assert!(logarithmic > linear * 10.0);
+        assert_eq!(ChartScale::Log.ratio(0.0, 5000.0), 0.0);
+        assert_eq!(ChartScale::Log.ratio(5000.0, 5000.0), 1.0);
+
+        let ticks = chart_ticks(Rect::new(0, 0, 80, 6), 5000.0, ChartScale::Log);
+        assert_eq!(
+            ticks,
+            vec![(0, 5000.0), (1, 1000.0), (2, 100.0), (4, 10.0), (5, 0.0),]
+        );
+    }
+
+    #[test]
     fn nice_max_rounds_to_powers() {
         assert_eq!(nice_max(0.0), 1.0);
-        assert_eq!(nice_max(1.2), 2.0);
+        assert_eq!(nice_max(1.2), 1.5);
         assert_eq!(nice_max(4.7), 5.0);
         assert_eq!(nice_max(8.3), 10.0);
-        assert_eq!(nice_max(104.1), 200.0);
-        assert_eq!(nice_max(2500.0), 5000.0);
+        assert_eq!(nice_max(51.5), 60.0);
+        assert_eq!(nice_max(104.1), 150.0);
+        assert_eq!(nice_max(2500.0), 2500.0);
     }
 
     #[test]
@@ -1568,20 +1621,6 @@ mod tests {
         assert_eq!(fmt_uptime(5.0), "0m05s");
         assert_eq!(fmt_uptime(83.0), "1m23s");
         assert_eq!(fmt_uptime(3723.0), "1h02m03s");
-    }
-
-    #[test]
-    fn spark_data_tails_and_clamps() {
-        let mut series = Series::new(10, 60.0);
-        for i in 0..8 {
-            series.push(i as f64, i as f64 * 10.0);
-        }
-        let (data, max) = spark_data_scaled(Some(&series), 4, 1.0);
-        assert_eq!(data, vec![40, 50, 60, 70]);
-        assert_eq!(max, Some(70.0));
-        let (empty, none) = spark_data_scaled(None, 4, 1.0);
-        assert!(empty.is_empty());
-        assert_eq!(none, None);
     }
 
     #[test]

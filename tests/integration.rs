@@ -127,13 +127,18 @@ async fn mock_llama_server() -> String {
         "n_prompt_tokens": 11, "n_prompt_tokens_processed": 5,
         "n_prompt_tokens_cache": 2, "params": {"temperature": 0.2}
     }]);
-    let chat = serde_json::json!({
-        "model": "lfm25",
-        "choices": [{"finish_reason": "length", "message": {"content": "hi"}}],
-        "timings": {"cache_n": 2, "prompt_n": 10, "prompt_per_second": 6.9,
-                    "predicted_n": 16, "predicted_per_second": 103.9},
-        "usage": {"prompt_tokens": 10, "completion_tokens": 16}
-    });
+    let stream = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({"choices": [{"delta": {"role": "assistant"}}]}),
+        serde_json::json!({"choices": [{"delta": {"content": "hi"}}]}),
+        serde_json::json!({
+            "model": "lfm25",
+            "choices": [],
+            "timings": {"cache_n": 2, "prompt_n": 10, "prompt_per_second": 6.9,
+                        "predicted_n": 16, "predicted_per_second": 103.9},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 16}
+        })
+    );
 
     let app = axum::Router::new()
         .route(
@@ -158,7 +163,18 @@ async fn mock_llama_server() -> String {
                 )
             }),
         )
-        .route("/v1/chat/completions", post(|| async { Json(chat) }));
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let stream = stream.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        stream,
+                    )
+                }
+            }),
+        );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -212,6 +228,12 @@ async fn llamacpp_collector_poll_and_probe() {
     assert!((probe.prompt_tps - 6.9).abs() < 0.01);
     assert_eq!(probe.gen_n, 16);
     assert_eq!(probe.cache_n, 2);
+    let ttft_ms = probe.ttft_ms.expect("streamed token should set TTFT");
+    assert!(ttft_ms > 0.0 && ttft_ms <= probe.wall_ms);
+    assert_eq!(
+        g.series.get("ttft_ms/lfm25").unwrap().last().unwrap().v,
+        ttft_ms
+    );
     assert!(g.probes_ok == 1 && g.probes_err == 0);
     // The second passive poll adds a slot-delta sample after the explicit
     // one-shot probe used by this collector test.
@@ -314,6 +336,8 @@ async fn llamacpp_collector_parses_prometheus_when_enabled() {
     assert_eq!(prom("llamacpp:predicted_tokens_seconds"), 55.5);
     assert_eq!(prom("llamacpp:prompt_tokens_seconds"), 79.1);
     assert_eq!(prom("other_metric"), 1.0);
+    // The first slot sample only establishes a baseline, so Prometheus supplies
+    // the initial throughput estimate until a slot delta is available.
     assert_eq!(
         g.series.get("gen_tps/mymodel").unwrap().last().unwrap().v,
         55.5
@@ -329,6 +353,20 @@ async fn llamacpp_collector_parses_prometheus_when_enabled() {
     );
 }
 
+// Official llama.cpp b12000 contract verified in docs and source:
+// - /slots exposes live n_prompt_tokens_processed and stats.n_gen counters;
+//   current source wraps next_token in an array even though the README's
+//   example still shows an object (server-context.cpp, server_slot::to_json).
+// - /metrics gauges are averages between scrapes, and every scrape resets their
+//   buckets (server-context.cpp, get_metrics; server-common.h, server_metrics).
+// - Generation stats are flushed only when a slot resets, so active generation
+//   can legitimately produce zero/stale Prometheus gauges (callback_on_reset).
+// - predicted_tokens_seconds uses decode steps, not accepted token count, to
+//   avoid inflating speculative decoding rates. Our live tok/s charts therefore
+//   prefer per-slot token deltas and use Prometheus only as a fallback.
+// Sources: https://github.com/ggml-org/llama.cpp/blob/b12000/tools/server/README.md
+// https://github.com/ggml-org/llama.cpp/blob/b12000/tools/server/server-context.cpp
+// https://github.com/ggml-org/llama.cpp/blob/b12000/tools/server/server-common.h
 #[tokio::test]
 async fn llamacpp_passive_slot_fallback_and_metrics_recovery() {
     use axum::routing::get;
@@ -336,6 +374,7 @@ async fn llamacpp_passive_slot_fallback_and_metrics_recovery() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let fail_metrics = Arc::new(AtomicBool::new(true));
+    let zero_metrics = Arc::new(AtomicBool::new(false));
     let prompt_progress = Arc::new(AtomicU64::new(100));
     let decode_progress = Arc::new(AtomicU64::new(20));
     let slot_delay_ms = Arc::new(AtomicU64::new(1000));
@@ -347,6 +386,7 @@ async fn llamacpp_passive_slot_fallback_and_metrics_recovery() {
     let slots_done = Arc::clone(&slots_finished);
     let slots_delay = Arc::clone(&slot_delay_ms);
     let metrics_failure = Arc::clone(&fail_metrics);
+    let metrics_zero = Arc::clone(&zero_metrics);
     let metrics_slots_done = Arc::clone(&slots_finished);
     let metrics_overlap = Arc::clone(&metrics_overlapped_slots);
     let app = axum::Router::new()
@@ -382,7 +422,7 @@ async fn llamacpp_passive_slot_fallback_and_metrics_recovery() {
                         "n_prompt_tokens": 1000,
                         "n_prompt_tokens_processed": prompt.load(Ordering::Relaxed),
                         "id_task": 7,
-                        "next_token": {"n_decoded": decoded.load(Ordering::Relaxed)}
+                        "next_token": [{"n_decoded": decoded.load(Ordering::Relaxed)}]
                     }]))
                 }
             }),
@@ -391,6 +431,7 @@ async fn llamacpp_passive_slot_fallback_and_metrics_recovery() {
             "/metrics",
             get(move || {
                 let fail = Arc::clone(&metrics_failure);
+                let zero = Arc::clone(&metrics_zero);
                 let slots_done = Arc::clone(&metrics_slots_done);
                 let overlap = Arc::clone(&metrics_overlap);
                 async move {
@@ -399,6 +440,13 @@ async fn llamacpp_passive_slot_fallback_and_metrics_recovery() {
                         (
                             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                             r#"{"error":{"message":"proxy error: Could not establish connection"}}"#
+                                .to_string(),
+                        )
+                    } else if zero.load(Ordering::Relaxed) {
+                        (
+                            axum::http::StatusCode::OK,
+                            "llamacpp:predicted_tokens_seconds 0\n\
+                             llamacpp:prompt_tokens_seconds 0\n"
                                 .to_string(),
                         )
                     } else {
@@ -451,21 +499,44 @@ async fn llamacpp_passive_slot_fallback_and_metrics_recovery() {
         assert!(g.last_error.is_some());
     }
 
+    // Recovered gauges may contain a non-zero scrape-window average, but the
+    // live slot counters have not advanced. Do not display that average as the
+    // current token rate.
     fail_metrics.store(false, Ordering::Relaxed);
     collector.poll(&state).await;
+    {
+        let g = state.lock().unwrap();
+        assert_eq!(g.last_error, None);
+        assert_eq!(
+            g.series.get("gen_tps/mymodel").unwrap().last().unwrap().v,
+            0.0
+        );
+        assert_eq!(
+            g.series
+                .get("prompt_tps/mymodel")
+                .unwrap()
+                .last()
+                .unwrap()
+                .v,
+            0.0
+        );
+    }
+
+    // Zero gauges must not mask later slot progress either.
+    zero_metrics.store(true, Ordering::Relaxed);
+    prompt_progress.store(500, Ordering::Relaxed);
+    decode_progress.store(100, Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    collector.poll(&state).await;
     let g = state.lock().unwrap();
-    assert_eq!(g.last_error, None);
-    assert_eq!(
-        g.series.get("gen_tps/mymodel").unwrap().last().unwrap().v,
-        55.5
-    );
-    assert_eq!(
+    assert!(g.series.get("gen_tps/mymodel").unwrap().last().unwrap().v > 0.0);
+    assert!(
         g.series
             .get("prompt_tps/mymodel")
             .unwrap()
             .last()
             .unwrap()
-            .v,
-        79.1
+            .v
+            > 0.0
     );
 }

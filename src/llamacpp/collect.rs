@@ -136,6 +136,9 @@ struct SlotRates {
 pub struct ProbeResult {
     pub model: String,
     pub wall_ms: f64,
+    /// Client-observed latency to the first streamed output token.
+    /// `None` when no streamed output token was observed.
+    pub ttft_ms: Option<f64>,
     /// Server-measured prompt processing throughput (tok/s).
     pub prompt_tps: f64,
     /// Server-measured generation throughput (tok/s).
@@ -368,14 +371,15 @@ impl Collector {
         })
     }
 
-    async fn post_json(
+    async fn post_stream(
         &self,
         url: reqwest::Url,
         body: &serde_json::Value,
-    ) -> Result<serde_json::Value, HttpError> {
+    ) -> Result<reqwest::Response, HttpError> {
         let resp = self
             .auth(self.probe_http.post(url))
             .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
             .body(body.to_string())
             .send()
             .await
@@ -384,18 +388,17 @@ impl Collector {
                 message: e.to_string(),
             })?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| HttpError {
-            status: Some(status.as_u16()),
-            message: e.to_string(),
-        })?;
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
+            let text = resp.text().await.map_err(|e| HttpError {
+                status: Some(status.as_u16()),
+                message: e.to_string(),
+            })?;
             return Err(HttpError {
                 status: Some(status.as_u16()),
                 message: summarize_error(&text),
             });
         }
-        Ok(v)
+        Ok(resp)
     }
 
     /// One collection cycle. Never panics; failures land in `State::last_error`.
@@ -520,12 +523,17 @@ impl Collector {
                         );
                     }
                 }
-                // Prefer the server's instantaneous gauges. Counter deltas keep
-                // the charts live when only the metrics proxy is unavailable.
-                if let Some(value) = prom_generation.or(slot_rates.generation) {
+                // Slot counters are live per-request token counts. Prometheus
+                // throughput gauges are averages between scrapes (and reset on
+                // every scrape), while generation stats may only be flushed when
+                // a slot is released. Prefer live token/s whenever slots provide
+                // a rate; retain Prometheus as a baseline and fallback.
+                let generation = slot_rates.generation.or(prom_generation);
+                let prompt = slot_rates.prompt.or(prom_prompt);
+                if let Some(value) = generation {
                     g.push(&format!("gen_tps/{model}"), now, value);
                 }
-                if let Some(value) = prom_prompt.or(slot_rates.prompt) {
+                if let Some(value) = prompt {
                     g.push(&format!("prompt_tps/{model}"), now, value);
                 }
             }
@@ -589,7 +597,7 @@ impl Collector {
         Ok(out)
     }
 
-    /// Send a tiny generation probe and record server-measured throughput.
+    /// Send a tiny streaming probe and record client latency plus server throughput.
     pub async fn probe(&self, st: &Arc<Mutex<State>>) {
         let target = {
             let g = st.lock().unwrap();
@@ -614,12 +622,17 @@ impl Collector {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": self.probe_tokens,
             "temperature": 0.0,
-            "stream": false,
+            "stream": true,
+            "stream_options": {"include_usage": true},
         });
         let started = Instant::now();
-        let resp = self
-            .post_json(self.url("v1/chat/completions"), &payload)
-            .await;
+        let resp = match self
+            .post_stream(self.url("v1/chat/completions"), &payload)
+            .await
+        {
+            Ok(resp) => read_probe_response(resp, started).await,
+            Err(e) => Err(e),
+        };
         let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         let mut pr = ProbeResult {
@@ -628,8 +641,9 @@ impl Collector {
             ..ProbeResult::default()
         };
         match resp {
-            Ok(v) => {
-                let chat: ChatResp = serde_json::from_value(v).unwrap_or_default();
+            Ok(response) => {
+                pr.ttft_ms = response.ttft_ms;
+                let chat = response.chat;
                 if let Some(e) = chat.error {
                     pr.error = Some(error_message(&e));
                 }
@@ -665,9 +679,121 @@ impl Collector {
             g.push(&format!("gen_tps/{m}"), now, pr.gen_tps);
             g.push(&format!("prompt_tps/{m}"), now, pr.prompt_tps);
             g.push(&format!("wall_ms/{m}"), now, pr.wall_ms);
+            if let Some(ttft_ms) = pr.ttft_ms {
+                g.push(&format!("ttft_ms/{m}"), now, ttft_ms);
+            }
         }
         g.last_probe = Some(pr);
     }
+}
+
+/// Read a streaming chat probe, retaining the final usage/timings event and the
+/// arrival time of the first real output token (role-only chunks do not count).
+async fn read_probe_response(
+    mut response: reqwest::Response,
+    started: Instant,
+) -> Result<ProbeResponse, HttpError> {
+    let is_stream = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+
+    // Be defensive with simple mocks and older servers that ignore `stream`.
+    // A buffered response cannot provide a meaningful client-observed TTFT.
+    if !is_stream {
+        let text = response.text().await.map_err(|e| HttpError {
+            status: None,
+            message: e.to_string(),
+        })?;
+        let chat = serde_json::from_str(&text).map_err(|e| HttpError {
+            status: None,
+            message: format!("invalid probe JSON: {e}"),
+        })?;
+        return Ok(ProbeResponse {
+            chat,
+            ttft_ms: None,
+        });
+    }
+
+    let mut probe = ProbeResponse::default();
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| HttpError {
+        status: None,
+        message: e.to_string(),
+    })? {
+        buffer.extend_from_slice(&chunk);
+        while let Some(event) = take_sse_event(&mut buffer) {
+            process_probe_event(&mut probe, &event, started.elapsed())?;
+        }
+    }
+    if !buffer.is_empty() {
+        process_probe_event(&mut probe, &buffer, started.elapsed())?;
+    }
+    Ok(probe)
+}
+
+/// Extract one complete SSE event. JSON is parsed only after the full event has
+/// arrived, so network chunks may split events (and UTF-8 characters) anywhere.
+fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let lf = buffer.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| (p, 4));
+    let (end, delimiter) = match (lf, crlf) {
+        (Some(a), Some(b)) => {
+            if a.0 <= b.0 {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return None,
+    };
+    let event = buffer[..end].to_vec();
+    buffer.drain(..end + delimiter);
+    Some(event)
+}
+
+fn process_probe_event(
+    probe: &mut ProbeResponse,
+    event: &[u8],
+    elapsed: Duration,
+) -> Result<(), HttpError> {
+    let event = std::str::from_utf8(event).map_err(|e| HttpError {
+        status: None,
+        message: format!("invalid probe stream UTF-8: {e}"),
+    })?;
+    let data = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(());
+    }
+
+    let chat: ChatResp = serde_json::from_str(&data).map_err(|e| HttpError {
+        status: None,
+        message: format!("invalid probe stream JSON: {e}"),
+    })?;
+    if probe.ttft_ms.is_none() && chat.has_stream_token() {
+        probe.ttft_ms = Some(elapsed.as_secs_f64() * 1000.0);
+    }
+    if chat.timings.is_some() {
+        probe.chat.timings = chat.timings;
+    }
+    if chat.usage.is_some() {
+        probe.chat.usage = chat.usage;
+    }
+    if chat.error.is_some() {
+        probe.chat.error = chat.error;
+    }
+    Ok(())
 }
 
 fn derive_slot_rates(
@@ -885,7 +1011,23 @@ struct SlotEntry {
 }
 
 #[derive(Deserialize)]
-struct NextToken {
+#[serde(untagged)]
+enum NextToken {
+    Object(NextTokenInfo),
+    Array(Vec<NextTokenInfo>),
+}
+
+impl NextToken {
+    fn n_decoded(self) -> Option<u64> {
+        match self {
+            NextToken::Object(token) => token.n_decoded,
+            NextToken::Array(tokens) => tokens.into_iter().find_map(|token| token.n_decoded),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NextTokenInfo {
     #[serde(default)]
     n_decoded: Option<u64>,
 }
@@ -911,7 +1053,7 @@ pub fn parse_slots(v: &serde_json::Value) -> Vec<SlotInfo> {
             tokens_processed: e.n_prompt_tokens_processed.unwrap_or(0),
             decoded_tokens: e
                 .n_decoded
-                .or_else(|| e.next_token.and_then(|next| next.n_decoded))
+                .or_else(|| e.next_token.and_then(NextToken::n_decoded))
                 .unwrap_or(0),
             tokens_cache: e.n_prompt_tokens_cache.unwrap_or(0),
             temperature: e.params.and_then(|p| p.temperature),
@@ -922,9 +1064,48 @@ pub fn parse_slots(v: &serde_json::Value) -> Vec<SlotInfo> {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ChatResp {
+    choices: Vec<ChatChoice>,
     timings: Option<Timings>,
     usage: Option<Usage>,
     error: Option<serde_json::Value>,
+}
+
+impl ChatResp {
+    fn has_stream_token(&self) -> bool {
+        self.choices.iter().any(|choice| {
+            choice.delta.as_ref().is_some_and(|delta| {
+                delta.content.as_ref().is_some_and(|s| !s.is_empty())
+                    || delta
+                        .reasoning_content
+                        .as_ref()
+                        .is_some_and(|s| !s.is_empty())
+                    || delta
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty())
+            })
+        })
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ChatChoice {
+    delta: Option<ChatDelta>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ChatDelta {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Default)]
+struct ProbeResponse {
+    chat: ChatResp,
+    ttft_ms: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -983,6 +1164,7 @@ mod tests {
         assert_eq!(models[0].ctx, None);
     }
 
+    // The official /slots README example still documents next_token as an object.
     #[test]
     fn parses_slots_payload() {
         let v = json!([{
@@ -1002,6 +1184,24 @@ mod tests {
         assert_eq!(s.temperature, Some(0.2));
     }
 
+    // Official b12000 server_slot::to_json emits a one-element array instead.
+    #[test]
+    fn parses_slots_payload_with_next_token_array() {
+        let v = json!([{
+            "id": 0, "n_ctx": 131072, "is_processing": true, "id_task": 27022,
+            "n_prompt_tokens": 14849, "n_prompt_tokens_processed": 77,
+            "next_token": [{"has_next_token": true, "n_decoded": 2882, "n_remain": -1}],
+            "params": {"temperature": 0.7}
+        }]);
+        let slots = parse_slots(&v);
+        assert_eq!(slots.len(), 1);
+        let s = &slots[0];
+        assert!(s.processing);
+        assert_eq!(s.task_id, Some(27022));
+        assert_eq!(s.tokens_processed, 77);
+        assert_eq!(s.decoded_tokens, 2882);
+    }
+
     #[test]
     fn parses_probe_timings() {
         let v = json!({
@@ -1019,6 +1219,80 @@ mod tests {
         assert!((t.prompt_per_second - 6.9118).abs() < 0.001);
         assert_eq!(t.predicted_n, 16);
         assert_eq!(t.cache_n, 0);
+    }
+
+    #[test]
+    fn probe_stream_measures_first_output_token_and_final_timings() {
+        let mut probe = ProbeResponse::default();
+        let events = [
+            (json!({"choices": [{"delta": {"role": "assistant"}}]}), 10),
+            (json!({"choices": [{"delta": {"content": ""}}]}), 20),
+            (json!({"choices": [{"delta": {"content": "hello"}}]}), 125),
+            (json!({"choices": [{"delta": {"content": " world"}}]}), 180),
+            (
+                json!({
+                    "choices": [],
+                    "timings": {"prompt_n": 10, "prompt_per_second": 8.0,
+                                "predicted_n": 2, "predicted_per_second": 100.0},
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                }),
+                200,
+            ),
+        ];
+        for (event, elapsed_ms) in events {
+            let event = format!("data: {event}\n");
+            process_probe_event(
+                &mut probe,
+                event.as_bytes(),
+                Duration::from_millis(elapsed_ms),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(probe.ttft_ms, Some(125.0));
+        let timings = probe.chat.timings.unwrap();
+        assert_eq!(timings.prompt_n, 10.0);
+        assert_eq!(timings.predicted_n, 2);
+        assert_eq!(probe.chat.usage.unwrap().completion_tokens, 2);
+    }
+
+    #[test]
+    fn probe_stream_counts_reasoning_and_tool_calls_as_output() {
+        let reasoning = json!({"choices": [{"delta": {"reasoning_content": "thinking"}}]});
+        let mut probe = ProbeResponse::default();
+        process_probe_event(
+            &mut probe,
+            format!("data: {reasoning}\n").as_bytes(),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        assert_eq!(probe.ttft_ms, Some(30.0));
+
+        let tool_call = json!({"choices": [{"delta": {"tool_calls": [{"index": 0}]}}]});
+        let mut probe = ProbeResponse::default();
+        process_probe_event(
+            &mut probe,
+            format!("data: {tool_call}\n").as_bytes(),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        assert_eq!(probe.ttft_ms, Some(40.0));
+    }
+
+    #[test]
+    fn sse_events_support_fragmentation_and_crlf() {
+        let mut buffer = b"data: first\n\n".to_vec();
+        buffer.extend_from_slice(b"data: {\"text\":\"h");
+        assert_eq!(take_sse_event(&mut buffer), Some(b"data: first".to_vec()));
+        assert!(take_sse_event(&mut buffer).is_none());
+
+        buffer.extend_from_slice("é\"}\r\n\r\n".as_bytes());
+        let event = take_sse_event(&mut buffer).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&event).unwrap(),
+            "data: {\"text\":\"hé\"}"
+        );
+        assert!(buffer.is_empty());
     }
 
     #[test]
