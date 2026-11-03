@@ -78,10 +78,12 @@ impl Series {
     }
 
     pub fn avg(&self) -> Option<f64> {
-        if self.buf.is_empty() {
-            return None;
-        }
-        Some(self.buf.iter().map(|s| s.v).sum::<f64>() / self.buf.len() as f64)
+        let (sum, count) = self
+            .buf
+            .iter()
+            .filter(|s| s.v != 0.0)
+            .fold((0.0, 0_usize), |(sum, count), s| (sum + s.v, count + 1));
+        (count > 0).then_some(sum / count as f64)
     }
 }
 
@@ -1317,6 +1319,19 @@ mod tests {
         assert_eq!(s.last().map(|x| x.v), Some(9.0));
         s.prune(100.0);
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn series_average_ignores_zero_samples() {
+        let mut s = Series::new(10, 60.0);
+        for (i, value) in [0.0, 6.0, 0.0, 9.0].into_iter().enumerate() {
+            s.push(i as f64, value);
+        }
+        assert_eq!(s.avg(), Some(7.5));
+
+        let mut idle = Series::new(10, 60.0);
+        idle.push(0.0, 0.0);
+        assert_eq!(idle.avg(), None);
     }
 
     #[test]
