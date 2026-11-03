@@ -11,19 +11,82 @@ use ratatui::Frame;
 
 use crate::llamacpp::collect::{Series, SlotInfo, State};
 
-const BG: Color = Color::Rgb(7, 11, 18);
-const SURFACE: Color = Color::Rgb(13, 20, 30);
-const RAISED: Color = Color::Rgb(19, 29, 42);
-const BORDER: Color = Color::Rgb(42, 57, 72);
-const TEXT: Color = Color::Rgb(220, 231, 239);
-const MUTED: Color = Color::Rgb(128, 148, 163);
-const DIM: Color = Color::Rgb(75, 94, 111);
-const CYAN: Color = Color::Rgb(40, 210, 205);
-const GREEN: Color = Color::Rgb(118, 211, 99);
-const AMBER: Color = Color::Rgb(245, 177, 66);
-const VIOLET: Color = Color::Rgb(190, 132, 240);
-const RED: Color = Color::Rgb(245, 99, 105);
-const WHITE: Color = Color::Rgb(244, 249, 252);
+/// Color scheme used by the dashboard. The light scheme keeps the same accent
+/// hues as the dark scheme, with darker variants that remain legible on white.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+
+    fn palette(self) -> Palette {
+        match self {
+            Self::Dark => DARK_PALETTE,
+            Self::Light => LIGHT_PALETTE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Palette {
+    bg: Color,
+    surface: Color,
+    grid: Color,
+    border: Color,
+    text: Color,
+    muted: Color,
+    dim: Color,
+    cyan: Color,
+    green: Color,
+    amber: Color,
+    violet: Color,
+    red: Color,
+    heading: Color,
+    fill_base: Color,
+}
+
+const DARK_PALETTE: Palette = Palette {
+    bg: Color::Rgb(7, 11, 18),
+    surface: Color::Rgb(13, 20, 30),
+    grid: Color::Rgb(19, 29, 42),
+    border: Color::Rgb(42, 57, 72),
+    text: Color::Rgb(220, 231, 239),
+    muted: Color::Rgb(128, 148, 163),
+    dim: Color::Rgb(75, 94, 111),
+    cyan: Color::Rgb(40, 210, 205),
+    green: Color::Rgb(118, 211, 99),
+    amber: Color::Rgb(245, 177, 66),
+    violet: Color::Rgb(190, 132, 240),
+    red: Color::Rgb(245, 99, 105),
+    heading: Color::Rgb(244, 249, 252),
+    fill_base: Color::Rgb(0, 0, 0),
+};
+
+const LIGHT_PALETTE: Palette = Palette {
+    bg: Color::Rgb(241, 245, 247),
+    surface: Color::Rgb(255, 255, 255),
+    grid: Color::Rgb(218, 227, 232),
+    border: Color::Rgb(178, 192, 201),
+    text: Color::Rgb(37, 55, 68),
+    muted: Color::Rgb(77, 98, 111),
+    dim: Color::Rgb(96, 116, 128),
+    cyan: Color::Rgb(0, 122, 119),
+    green: Color::Rgb(38, 116, 57),
+    amber: Color::Rgb(145, 82, 0),
+    violet: Color::Rgb(113, 58, 151),
+    red: Color::Rgb(176, 35, 52),
+    heading: Color::Rgb(15, 39, 53),
+    fill_base: Color::Rgb(255, 255, 255),
+};
 
 const PARTIAL_BLOCKS: [&str; 8] = ["", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
 
@@ -83,18 +146,19 @@ impl Trend {
         }
     }
 
-    fn color(self) -> Color {
+    fn color(self, p: &Palette) -> Color {
         match self {
-            Self::Up => GREEN,
-            Self::Down => RED,
-            Self::Steady => MUTED,
-            Self::Unknown => DIM,
+            Self::Up => p.green,
+            Self::Down => p.red,
+            Self::Steady => p.muted,
+            Self::Unknown => p.dim,
         }
     }
 }
 
-pub fn draw(f: &mut Frame, st: &State) {
-    f.render_widget(Block::default().style(Style::new().bg(BG)), f.area());
+pub fn draw(f: &mut Frame, st: &State, theme: Theme) {
+    let p = theme.palette();
+    f.render_widget(Block::default().style(Style::new().bg(p.bg)), f.area());
     if f.area().is_empty() {
         return;
     }
@@ -107,9 +171,9 @@ pub fn draw(f: &mut Frame, st: &State) {
     constraints.extend([Constraint::Min(3), Constraint::Length(1)]);
     let areas = Layout::vertical(constraints).split(f.area());
 
-    draw_header(f, areas[0], st);
+    draw_header(f, areas[0], st, &p);
     let main_index = if show_kpis {
-        draw_kpis(f, areas[1], st);
+        draw_kpis(f, areas[1], st, &p);
         2
     } else {
         1
@@ -122,29 +186,29 @@ pub fn draw(f: &mut Frame, st: &State) {
             Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(40)])
                 .spacing(1)
                 .areas(main);
-        draw_sidebar(f, left, st);
-        draw_charts(f, right, st);
+        draw_sidebar(f, left, st, &p);
+        draw_charts(f, right, st, &p);
     } else if main.height >= 16 {
         let [model, charts] =
             Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).areas(main);
-        draw_compact_model(f, model, st);
-        draw_charts(f, charts, st);
+        draw_compact_model(f, model, st, &p);
+        draw_charts(f, charts, st, &p);
     } else {
-        draw_charts(f, main, st);
+        draw_charts(f, main, st, &p);
     }
 
-    draw_footer(f, areas[areas.len() - 1], st);
+    draw_footer(f, areas[areas.len() - 1], st, theme, &p);
 }
 
 // ---------------------------------------------------------------------------
 // shared chrome
 // ---------------------------------------------------------------------------
 
-fn panel<'a>(title: Line<'a>, accent: Color) -> Block<'a> {
+fn panel<'a>(title: Line<'a>, accent: Color, p: &Palette) -> Block<'a> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(BORDER).bg(SURFACE))
-        .style(Style::new().bg(SURFACE))
+        .border_style(Style::new().fg(p.border).bg(p.surface))
+        .style(Style::new().bg(p.surface))
         .title(title)
         .title_style(Style::new().fg(accent).add_modifier(Modifier::BOLD))
         .padding(Padding::horizontal(1))
@@ -157,10 +221,10 @@ fn title(text: impl Into<String>, accent: Color) -> Line<'static> {
     ))
 }
 
-fn right_title(text: impl Into<String>) -> Line<'static> {
+fn right_title(text: impl Into<String>, p: &Palette) -> Line<'static> {
     Line::from(Span::styled(
         format!(" {} ", text.into()),
-        Style::new().fg(DIM),
+        Style::new().fg(p.dim),
     ))
     .right_aligned()
 }
@@ -169,10 +233,10 @@ fn right_title(text: impl Into<String>) -> Line<'static> {
 // header / footer
 // ---------------------------------------------------------------------------
 
-fn draw_header(f: &mut Frame, area: Rect, st: &State) {
-    let status_color = if st.up { GREEN } else { RED };
+fn draw_header(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
+    let status_color = if st.up { p.green } else { p.red };
     let status = if st.up { "● LIVE" } else { "● DOWN" };
-    let block = panel(Line::default(), CYAN).padding(Padding::horizontal(1));
+    let block = panel(Line::default(), p.cyan, p).padding(Padding::horizontal(1));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 2 {
@@ -182,17 +246,17 @@ fn draw_header(f: &mut Frame, area: Rect, st: &State) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
     let top = Layout::horizontal([Constraint::Min(30), Constraint::Length(26)]).split(rows[0]);
     let brand = Line::from(vec![
-        Span::styled("◆ ", Style::new().fg(CYAN)),
+        Span::styled("◆ ", Style::new().fg(p.cyan)),
         Span::styled(
             "RUSTMETRICS",
-            Style::new().fg(WHITE).add_modifier(Modifier::BOLD),
+            Style::new().fg(p.heading).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  /  ", Style::new().fg(DIM)),
+        Span::styled("  /  ", Style::new().fg(p.dim)),
         Span::styled(
             "LLAMA.CPP",
-            Style::new().fg(CYAN).add_modifier(Modifier::BOLD),
+            Style::new().fg(p.cyan).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  OBSERVABILITY", Style::new().fg(MUTED)),
+        Span::styled("  OBSERVABILITY", Style::new().fg(p.muted)),
     ]);
     f.render_widget(Paragraph::new(brand), top[0]);
     f.render_widget(
@@ -203,7 +267,7 @@ fn draw_header(f: &mut Frame, area: Rect, st: &State) {
             ),
             Span::styled(
                 format!("  SESSION {}", fmt_uptime(st.uptime_secs())),
-                Style::new().fg(MUTED),
+                Style::new().fg(p.muted),
             ),
         ]))
         .alignment(Alignment::Right),
@@ -213,21 +277,21 @@ fn draw_header(f: &mut Frame, area: Rect, st: &State) {
     let bottom = Layout::horizontal([Constraint::Min(30), Constraint::Length(28)]).split(rows[1]);
     let info = if let Some(error) = &st.last_error {
         Line::from(vec![
-            Span::styled("! ", Style::new().fg(RED).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("err: {error}"), Style::new().fg(RED)),
+            Span::styled("! ", Style::new().fg(p.red).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("err: {error}"), Style::new().fg(p.red)),
         ])
     } else {
         let mut spans = vec![
-            Span::styled("URL ", Style::new().fg(DIM)),
-            Span::styled(st.base.clone(), Style::new().fg(CYAN)),
+            Span::styled("URL ", Style::new().fg(p.dim)),
+            Span::styled(st.base.clone(), Style::new().fg(p.cyan)),
         ];
         if let Some(role) = &st.role {
-            spans.push(Span::styled("   ·   ", Style::new().fg(DIM)));
-            spans.push(Span::styled(role.clone(), Style::new().fg(TEXT)));
+            spans.push(Span::styled("   ·   ", Style::new().fg(p.dim)));
+            spans.push(Span::styled(role.clone(), Style::new().fg(p.text)));
         }
         if let Some(build) = &st.build {
-            spans.push(Span::styled("  build ", Style::new().fg(DIM)));
-            spans.push(Span::styled(build.clone(), Style::new().fg(MUTED)));
+            spans.push(Span::styled("  build ", Style::new().fg(p.dim)));
+            spans.push(Span::styled(build.clone(), Style::new().fg(p.muted)));
         }
         Line::from(spans)
     };
@@ -236,12 +300,12 @@ fn draw_header(f: &mut Frame, area: Rect, st: &State) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!("{} models", st.models.len()),
-                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+                Style::new().fg(p.text).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(", ", Style::new().fg(DIM)),
+            Span::styled(", ", Style::new().fg(p.dim)),
             Span::styled(
                 format!("{} loaded", st.loaded_count()),
-                Style::new().fg(GREEN),
+                Style::new().fg(p.green),
             ),
         ]))
         .alignment(Alignment::Right),
@@ -249,25 +313,37 @@ fn draw_header(f: &mut Frame, area: Rect, st: &State) {
     );
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, st: &State) {
-    let columns = Layout::horizontal([Constraint::Min(38), Constraint::Length(58)]).split(area);
+fn draw_footer(f: &mut Frame, area: Rect, st: &State, theme: Theme, p: &Palette) {
+    let columns = Layout::horizontal([Constraint::Min(48), Constraint::Length(58)]).split(area);
     let key = |key: &'static str| {
         Span::styled(
             format!(" {key} "),
-            Style::new().fg(BG).bg(CYAN).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(p.bg)
+                .bg(p.cyan)
+                .add_modifier(Modifier::BOLD),
         )
+    };
+    let next_theme = match theme {
+        Theme::Dark => "light",
+        Theme::Light => "dark",
     };
     let keys = Line::from(vec![
         key("tab"),
-        Span::styled("model  ", Style::new().fg(MUTED)),
+        Span::styled("model  ", Style::new().fg(p.muted)),
         key("m"),
-        Span::styled("metrics  ", Style::new().fg(MUTED)),
+        Span::styled("metrics  ", Style::new().fg(p.muted)),
+        key("t"),
+        Span::styled(format!("{next_theme}  "), Style::new().fg(p.muted)),
         key("r"),
-        Span::styled("refresh  ", Style::new().fg(MUTED)),
+        Span::styled("refresh  ", Style::new().fg(p.muted)),
         key("q"),
-        Span::styled("quit", Style::new().fg(MUTED)),
+        Span::styled("quit", Style::new().fg(p.muted)),
     ]);
-    f.render_widget(Paragraph::new(keys).style(Style::new().bg(BG)), columns[0]);
+    f.render_widget(
+        Paragraph::new(keys).style(Style::new().bg(p.bg)),
+        columns[0],
+    );
 
     let source = match st.metrics_supported {
         Some(true) => "prometheus",
@@ -275,23 +351,23 @@ fn draw_footer(f: &mut Frame, area: Rect, st: &State) {
         None => "discovering",
     };
     let mut spans = vec![
-        Span::styled("● passive", Style::new().fg(GREEN)),
-        Span::styled(format!("  ·  {source}"), Style::new().fg(MUTED)),
+        Span::styled("● passive", Style::new().fg(p.green)),
+        Span::styled(format!("  ·  {source}"), Style::new().fg(p.muted)),
         Span::styled(
             format!("  ·  {} history", fmt_window(st.window)),
-            Style::new().fg(DIM),
+            Style::new().fg(p.dim),
         ),
     ];
     if st.metrics_supported == Some(true) {
         spans.push(Span::styled(
             format!("  ·  {} series", st.prom_discovered),
-            Style::new().fg(DIM),
+            Style::new().fg(p.dim),
         ));
     }
     f.render_widget(
         Paragraph::new(Line::from(spans))
             .alignment(Alignment::Right)
-            .style(Style::new().bg(BG)),
+            .style(Style::new().bg(p.bg)),
         columns[1],
     );
 }
@@ -300,7 +376,7 @@ fn draw_footer(f: &mut Frame, area: Rect, st: &State) {
 // KPI cards
 // ---------------------------------------------------------------------------
 
-fn draw_kpis(f: &mut Frame, area: Rect, st: &State) {
+fn draw_kpis(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let focus = st.focus_model().map(|m| m.name.clone()).unwrap_or_default();
     let cards = Layout::horizontal([
         Constraint::Ratio(1, 4),
@@ -317,7 +393,8 @@ fn draw_kpis(f: &mut Frame, area: Rect, st: &State) {
         st.series.get(&format!("gen_tps/{focus}")),
         "GENERATION",
         "tok/s",
-        CYAN,
+        p.cyan,
+        p,
     );
     metric_card(
         f,
@@ -325,7 +402,8 @@ fn draw_kpis(f: &mut Frame, area: Rect, st: &State) {
         st.series.get(&format!("prompt_tps/{focus}")),
         "PROMPT",
         "tok/s",
-        GREEN,
+        p.green,
+        p,
     );
     metric_card(
         f,
@@ -333,7 +411,8 @@ fn draw_kpis(f: &mut Frame, area: Rect, st: &State) {
         st.series.get(&format!("cache_tokens/{focus}")),
         "KV CACHE",
         "tokens",
-        AMBER,
+        p.amber,
+        p,
     );
     metric_card(
         f,
@@ -341,7 +420,8 @@ fn draw_kpis(f: &mut Frame, area: Rect, st: &State) {
         st.series.get(&format!("ctx_pct/{focus}")),
         "CONTEXT",
         "%",
-        VIOLET,
+        p.violet,
+        p,
     );
 }
 
@@ -352,9 +432,10 @@ fn metric_card(
     name: &str,
     unit: &str,
     accent: Color,
+    p: &Palette,
 ) {
     let stats = MetricStats::from_series(series);
-    let block = panel(title(name, accent), accent);
+    let block = panel(title(name, accent), accent, p);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 3 {
@@ -372,7 +453,10 @@ fn metric_card(
     let top = Layout::horizontal([Constraint::Min(8), Constraint::Length(2)]).split(rows[0]);
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(value, Style::new().fg(WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                value,
+                Style::new().fg(p.heading).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!(" {unit}"), Style::new().fg(accent)),
         ])),
         top[0],
@@ -380,7 +464,7 @@ fn metric_card(
     f.render_widget(
         Paragraph::new(Span::styled(
             trend.symbol(),
-            Style::new().fg(trend.color()).add_modifier(Modifier::BOLD),
+            Style::new().fg(trend.color(p)).add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Right),
         top[1],
@@ -395,12 +479,12 @@ fn metric_card(
             Sparkline::default()
                 .data(&data)
                 .max(spark_max as u64)
-                .style(Style::new().fg(accent).bg(SURFACE)),
+                .style(Style::new().fg(accent).bg(p.surface)),
             rows[1],
         );
     } else {
         f.render_widget(
-            Paragraph::new(Span::styled("waiting for samples", Style::new().fg(DIM))),
+            Paragraph::new(Span::styled("waiting for samples", Style::new().fg(p.dim))),
             rows[1],
         );
     }
@@ -410,7 +494,7 @@ fn metric_card(
         None => "avg —  ·  peak —".to_string(),
     };
     f.render_widget(
-        Paragraph::new(Span::styled(summary, Style::new().fg(MUTED))),
+        Paragraph::new(Span::styled(summary, Style::new().fg(p.muted))),
         rows[2],
     );
 }
@@ -419,7 +503,7 @@ fn metric_card(
 // model / slot sidebar
 // ---------------------------------------------------------------------------
 
-fn draw_sidebar(f: &mut Frame, area: Rect, st: &State) {
+fn draw_sidebar(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let show_session = area.height >= 25;
     let constraints = if show_session {
         vec![
@@ -431,23 +515,27 @@ fn draw_sidebar(f: &mut Frame, area: Rect, st: &State) {
         vec![Constraint::Length(9), Constraint::Min(8)]
     };
     let areas = Layout::vertical(constraints).spacing(1).split(area);
-    draw_model_card(f, areas[0], st);
-    draw_slots(f, areas[1], st);
+    draw_model_card(f, areas[0], st, p);
+    draw_slots(f, areas[1], st, p);
     if show_session {
-        draw_session(f, areas[2], st);
+        draw_session(f, areas[2], st, p);
     }
 }
 
-fn draw_model_card(f: &mut Frame, area: Rect, st: &State) {
+fn draw_model_card(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let focus = st.focus_model();
-    let block = panel(title("active model", CYAN), CYAN).title(right_title("tab: active only"));
+    let block =
+        panel(title("active model", p.cyan), p.cyan, p).title(right_title("tab: active only", p));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let Some(model) = focus else {
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled("no model selected", Style::new().fg(MUTED))),
-                Line::from(Span::styled("waiting for /v1/models", Style::new().fg(DIM))),
+                Line::from(Span::styled("no model selected", Style::new().fg(p.muted))),
+                Line::from(Span::styled(
+                    "waiting for /v1/models",
+                    Style::new().fg(p.dim),
+                )),
             ]),
             inner,
         );
@@ -455,7 +543,7 @@ fn draw_model_card(f: &mut Frame, area: Rect, st: &State) {
     };
     if inner.height < 6 {
         f.render_widget(
-            Paragraph::new(model.name.as_str()).style(Style::new().fg(WHITE)),
+            Paragraph::new(model.name.as_str()).style(Style::new().fg(p.heading)),
             inner,
         );
         return;
@@ -473,12 +561,12 @@ fn draw_model_card(f: &mut Frame, area: Rect, st: &State) {
     f.render_widget(
         Paragraph::new(Span::styled(
             model.name.clone(),
-            Style::new().fg(WHITE).add_modifier(Modifier::BOLD),
+            Style::new().fg(p.heading).add_modifier(Modifier::BOLD),
         )),
         rows[0],
     );
 
-    let state_color = model_state_color(&model.state);
+    let state_color = model_state_color(&model.state, p);
     let mut state = vec![
         Span::styled("● ", Style::new().fg(state_color)),
         Span::styled(
@@ -487,37 +575,44 @@ fn draw_model_card(f: &mut Frame, area: Rect, st: &State) {
         ),
     ];
     if let Some(spec) = &model.spec_type {
-        state.push(Span::styled(format!("  ·  {spec}"), Style::new().fg(MUTED)));
+        state.push(Span::styled(
+            format!("  ·  {spec}"),
+            Style::new().fg(p.muted),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(state)), rows[1]);
 
     let mut metadata = Vec::new();
     if let Some(ctx) = model.ctx {
-        metadata.push(Span::styled("CTX ", Style::new().fg(DIM)));
-        metadata.push(Span::styled(fmt_num(ctx as f64), Style::new().fg(TEXT)));
+        metadata.push(Span::styled("CTX ", Style::new().fg(p.dim)));
+        metadata.push(Span::styled(fmt_num(ctx as f64), Style::new().fg(p.text)));
     }
     if let Some(gpu) = &model.main_gpu {
-        metadata.push(Span::styled("   GPU ", Style::new().fg(DIM)));
-        metadata.push(Span::styled(gpu.clone(), Style::new().fg(TEXT)));
+        metadata.push(Span::styled("   GPU ", Style::new().fg(p.dim)));
+        metadata.push(Span::styled(gpu.clone(), Style::new().fg(p.text)));
     }
     if let Some(layers) = &model.gpu_layers {
-        metadata.push(Span::styled("   LAYERS ", Style::new().fg(DIM)));
-        metadata.push(Span::styled(layers.clone(), Style::new().fg(TEXT)));
+        metadata.push(Span::styled("   LAYERS ", Style::new().fg(p.dim)));
+        metadata.push(Span::styled(layers.clone(), Style::new().fg(p.text)));
     }
     if metadata.is_empty() {
         metadata.push(Span::styled(
             "runtime metadata unavailable",
-            Style::new().fg(DIM),
+            Style::new().fg(p.dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(metadata)), rows[2]);
     f.render_widget(
-        Paragraph::new(Span::styled("HF REPOSITORY", Style::new().fg(DIM))),
+        Paragraph::new(Span::styled("HF REPOSITORY", Style::new().fg(p.dim))),
         rows[3],
     );
     f.render_widget(
         Paragraph::new(model.hf_repo.as_deref().unwrap_or("not reported"))
-            .style(Style::new().fg(if model.hf_repo.is_some() { MUTED } else { DIM }))
+            .style(Style::new().fg(if model.hf_repo.is_some() {
+                p.muted
+            } else {
+                p.dim
+            }))
             .wrap(Wrap { trim: false }),
         rows[4],
     );
@@ -525,31 +620,31 @@ fn draw_model_card(f: &mut Frame, area: Rect, st: &State) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!("{:02}", st.loaded_count()),
-                Style::new().fg(GREEN).add_modifier(Modifier::BOLD),
+                Style::new().fg(p.green).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" loaded  /  ", Style::new().fg(DIM)),
-            Span::styled(format!("{:02}", st.models.len()), Style::new().fg(TEXT)),
-            Span::styled(" models in fleet", Style::new().fg(DIM)),
+            Span::styled(" loaded  /  ", Style::new().fg(p.dim)),
+            Span::styled(format!("{:02}", st.models.len()), Style::new().fg(p.text)),
+            Span::styled(" models in fleet", Style::new().fg(p.dim)),
         ])),
         rows[5],
     );
 }
 
-fn model_state_color(state: &str) -> Color {
+fn model_state_color(state: &str, p: &Palette) -> Color {
     match state {
-        "loaded" => GREEN,
-        "loading" | "sleeping" => AMBER,
-        "unloaded" => DIM,
-        _ => CYAN,
+        "loaded" => p.green,
+        "loading" | "sleeping" => p.amber,
+        "unloaded" => p.dim,
+        _ => p.cyan,
     }
 }
 
-fn draw_compact_model(f: &mut Frame, area: Rect, st: &State) {
+fn draw_compact_model(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let focus = st.focus_model();
     let name = focus
         .map(|m| m.name.as_str())
         .unwrap_or("no model selected");
-    let block = panel(title("active model", CYAN), CYAN);
+    let block = panel(title("active model", p.cyan), p.cyan, p);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let columns = Layout::horizontal([
@@ -568,13 +663,13 @@ fn draw_compact_model(f: &mut Frame, area: Rect, st: &State) {
         Paragraph::new(vec![
             Line::from(Span::styled(
                 name,
-                Style::new().fg(WHITE).add_modifier(Modifier::BOLD),
+                Style::new().fg(p.heading).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 format!("● {}", state.to_uppercase()),
-                Style::new().fg(model_state_color(state)),
+                Style::new().fg(model_state_color(state, p)),
             )),
-            Line::from(Span::styled(repo, Style::new().fg(MUTED))),
+            Line::from(Span::styled(repo, Style::new().fg(p.muted))),
         ])
         .wrap(Wrap { trim: true }),
         columns[0],
@@ -586,16 +681,16 @@ fn draw_compact_model(f: &mut Frame, area: Rect, st: &State) {
     f.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
-                Span::styled(format!("{busy}"), Style::new().fg(AMBER)),
+                Span::styled(format!("{busy}"), Style::new().fg(p.amber)),
                 Span::styled(
                     format!(" / {} busy", st.slots.len()),
-                    Style::new().fg(MUTED),
+                    Style::new().fg(p.muted),
                 ),
             ]),
-            Line::from(Span::styled("SLOT ACTIVITY", Style::new().fg(DIM))),
+            Line::from(Span::styled("SLOT ACTIVITY", Style::new().fg(p.dim))),
             Line::from(Span::styled(
                 format!("{} / {} ctx", fmt_count(used), fmt_count(total)),
-                Style::new().fg(VIOLET),
+                Style::new().fg(p.violet),
             )),
         ]),
         columns[1],
@@ -616,31 +711,31 @@ fn draw_compact_model(f: &mut Frame, area: Rect, st: &State) {
     let activity_lines = vec![
         Line::from(Span::styled(
             format!("{generation} tok/s"),
-            Style::new().fg(CYAN).add_modifier(Modifier::BOLD),
+            Style::new().fg(p.cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!("{prompt} prompt tok/s"),
-            Style::new().fg(GREEN),
+            Style::new().fg(p.green),
         )),
-        Line::from(Span::styled("PASSIVE THROUGHPUT", Style::new().fg(DIM))),
+        Line::from(Span::styled("PASSIVE THROUGHPUT", Style::new().fg(p.dim))),
     ];
     f.render_widget(Paragraph::new(activity_lines), columns[2]);
 }
 
-fn draw_slots(f: &mut Frame, area: Rect, st: &State) {
+fn draw_slots(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let busy = st.slots.iter().filter(|s| s.processing).count();
-    let block = panel(title("slot activity", VIOLET), VIOLET)
-        .title(right_title(format!("{busy}/{} busy", st.slots.len())));
+    let block = panel(title("slot activity", p.violet), p.violet, p)
+        .title(right_title(format!("{busy}/{} busy", st.slots.len()), p));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if st.slots.is_empty() {
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled("○  NO ACTIVE SLOTS", Style::new().fg(MUTED))),
+                Line::from(Span::styled("○  NO ACTIVE SLOTS", Style::new().fg(p.muted))),
                 Line::from(""),
                 Line::from(Span::styled(
                     "the watched model is not loaded",
-                    Style::new().fg(DIM),
+                    Style::new().fg(p.dim),
                 )),
             ]),
             inner,
@@ -663,7 +758,7 @@ fn draw_slots(f: &mut Frame, area: Rect, st: &State) {
             width: inner.width,
             height: height as u16,
         };
-        draw_slot(f, slot_area, slot);
+        draw_slot(f, slot_area, slot, p);
     }
 
     let hidden = st.slots.len().saturating_sub(visible);
@@ -671,7 +766,7 @@ fn draw_slots(f: &mut Frame, area: Rect, st: &State) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 format!("+ {hidden} more slots"),
-                Style::new().fg(DIM),
+                Style::new().fg(p.dim),
             )),
             Rect {
                 x: inner.x,
@@ -683,12 +778,12 @@ fn draw_slots(f: &mut Frame, area: Rect, st: &State) {
     }
 }
 
-fn draw_slot(f: &mut Frame, area: Rect, slot: &SlotInfo) {
+fn draw_slot(f: &mut Frame, area: Rect, slot: &SlotInfo, p: &Palette) {
     if area.height < 3 {
         return;
     }
     let state = if slot.processing { "BUSY" } else { "IDLE" };
-    let state_color = if slot.processing { AMBER } else { GREEN };
+    let state_color = if slot.processing { p.amber } else { p.green };
     let ratio = if slot.n_ctx > 0 {
         slot.prompt_tokens as f64 / slot.n_ctx as f64
     } else {
@@ -706,7 +801,7 @@ fn draw_slot(f: &mut Frame, area: Rect, slot: &SlotInfo) {
     let mut heading = vec![
         Span::styled(
             format!("#{:02}", slot.id),
-            Style::new().fg(WHITE).add_modifier(Modifier::BOLD),
+            Style::new().fg(p.heading).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ● ", Style::new().fg(state_color)),
         Span::styled(
@@ -717,40 +812,43 @@ fn draw_slot(f: &mut Frame, area: Rect, slot: &SlotInfo) {
     if let Some(temp) = slot.temperature {
         heading.push(Span::styled(
             format!("   T {temp:.2}"),
-            Style::new().fg(DIM),
+            Style::new().fg(p.dim),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(heading)), rows[0]);
     f.render_widget(
-        Paragraph::new(meter_line(rows[1].width as usize, ratio, VIOLET)),
+        Paragraph::new(meter_line(rows[1].width as usize, ratio, p.violet, p)),
         rows[1],
     );
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("ctx ", Style::new().fg(DIM)),
-            Span::styled(fmt_count(slot.prompt_tokens), Style::new().fg(TEXT)),
+            Span::styled("ctx ", Style::new().fg(p.dim)),
+            Span::styled(fmt_count(slot.prompt_tokens), Style::new().fg(p.text)),
             Span::styled(
                 format!(" / {}", fmt_count(slot.n_ctx)),
-                Style::new().fg(MUTED),
+                Style::new().fg(p.muted),
             ),
-            Span::styled(format!("   {:.1}%", ratio * 100.0), Style::new().fg(VIOLET)),
+            Span::styled(
+                format!("   {:.1}%", ratio * 100.0),
+                Style::new().fg(p.violet),
+            ),
         ])),
         rows[2],
     );
     if area.height >= 4 {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("cache ", Style::new().fg(DIM)),
-                Span::styled(fmt_count(slot.tokens_cache), Style::new().fg(MUTED)),
-                Span::styled("   processed ", Style::new().fg(DIM)),
-                Span::styled(fmt_count(slot.tokens_processed), Style::new().fg(MUTED)),
+                Span::styled("cache ", Style::new().fg(p.dim)),
+                Span::styled(fmt_count(slot.tokens_cache), Style::new().fg(p.muted)),
+                Span::styled("   processed ", Style::new().fg(p.dim)),
+                Span::styled(fmt_count(slot.tokens_processed), Style::new().fg(p.muted)),
             ])),
             rows[3],
         );
     }
 }
 
-fn meter_line(width: usize, ratio: f64, color: Color) -> Line<'static> {
+fn meter_line(width: usize, ratio: f64, color: Color, p: &Palette) -> Line<'static> {
     let mut filled = (width as f64 * ratio.clamp(0.0, 1.0)).round() as usize;
     if ratio > 0.0 && width > 0 {
         filled = filled.max(1);
@@ -758,7 +856,7 @@ fn meter_line(width: usize, ratio: f64, color: Color) -> Line<'static> {
     filled = filled.min(width);
     Line::from(vec![
         Span::styled("━".repeat(filled), Style::new().fg(color)),
-        Span::styled("─".repeat(width - filled), Style::new().fg(BORDER)),
+        Span::styled("─".repeat(width - filled), Style::new().fg(p.border)),
     ])
 }
 
@@ -769,8 +867,9 @@ fn prom_value(st: &State, name: &str) -> Option<f64> {
         .map(|sample| sample.v)
 }
 
-fn draw_session(f: &mut Frame, area: Rect, st: &State) {
-    let block = panel(title("request activity", AMBER), AMBER).title(right_title("read only"));
+fn draw_session(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
+    let block =
+        panel(title("request activity", p.amber), p.amber, p).title(right_title("read only", p));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let value = |name: &str| {
@@ -786,8 +885,8 @@ fn draw_session(f: &mut Frame, area: Rect, st: &State) {
     };
     let lines = vec![
         Line::from(vec![
-            Span::styled("MODE  ", Style::new().fg(DIM)),
-            Span::styled("passive API monitor", Style::new().fg(TEXT)),
+            Span::styled("MODE  ", Style::new().fg(p.dim)),
+            Span::styled("passive API monitor", Style::new().fg(p.text)),
         ]),
         Line::from(Span::styled(
             format!(
@@ -795,7 +894,7 @@ fn draw_session(f: &mut Frame, area: Rect, st: &State) {
                 value("llamacpp:requests_processing"),
                 value("llamacpp:requests_deferred")
             ),
-            Style::new().fg(MUTED),
+            Style::new().fg(p.muted),
         )),
         Line::from(Span::styled(
             format!(
@@ -803,17 +902,17 @@ fn draw_session(f: &mut Frame, area: Rect, st: &State) {
                 value("llamacpp:n_decode_total"),
                 value("llamacpp:prompt_tokens_cached_total")
             ),
-            Style::new().fg(MUTED),
+            Style::new().fg(p.muted),
         )),
         Line::from(Span::styled(
             format!("{busy} busy  /  {} slots", st.slots.len()),
-            Style::new().fg(AMBER),
+            Style::new().fg(p.amber),
         )),
         Line::from(Span::styled(
             "no inference requests sent",
-            Style::new().fg(GREEN),
+            Style::new().fg(p.green),
         )),
-        Line::from(Span::styled(source, Style::new().fg(DIM))),
+        Line::from(Span::styled(source, Style::new().fg(p.dim))),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -822,7 +921,7 @@ fn draw_session(f: &mut Frame, area: Rect, st: &State) {
 // charts
 // ---------------------------------------------------------------------------
 
-fn draw_charts(f: &mut Frame, area: Rect, st: &State) {
+fn draw_charts(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let focus = st.focus_model().map(|m| m.name.clone()).unwrap_or_default();
     let show_prom = st.show_metrics && st.metrics_supported == Some(true);
     let secondary_height = if area.height >= 24 {
@@ -853,7 +952,8 @@ fn draw_charts(f: &mut Frame, area: Rect, st: &State) {
         st.series.get(&format!("gen_tps/{focus}")),
         &format!("generation / {focus}"),
         "tok/s",
-        CYAN,
+        p.cyan,
+        p,
     );
     area_chart(
         f,
@@ -861,7 +961,8 @@ fn draw_charts(f: &mut Frame, area: Rect, st: &State) {
         st.series.get(&format!("prompt_tps/{focus}")),
         "prompt throughput",
         "tok/s",
-        GREEN,
+        p.green,
+        p,
     );
 
     if show_prom {
@@ -874,9 +975,10 @@ fn draw_charts(f: &mut Frame, area: Rect, st: &State) {
             st.series.get(&format!("ctx_pct/{focus}")),
             "context window",
             "%",
-            VIOLET,
+            p.violet,
+            p,
         );
-        draw_prom_table(f, bottom[1], st);
+        draw_prom_table(f, bottom[1], st, p);
     } else {
         area_chart(
             f,
@@ -884,7 +986,8 @@ fn draw_charts(f: &mut Frame, area: Rect, st: &State) {
             st.series.get(&format!("ctx_pct/{focus}")),
             "context window",
             "%",
-            VIOLET,
+            p.violet,
+            p,
         );
     }
 }
@@ -896,6 +999,7 @@ fn area_chart(
     name: &str,
     unit: &str,
     accent: Color,
+    p: &Palette,
 ) {
     if area.is_empty() {
         return;
@@ -915,11 +1019,11 @@ fn area_chart(
         (None, width) if width >= 38 => "waiting for samples".to_string(),
         _ => String::new(),
     };
-    let block = panel(title(name, accent), accent);
+    let block = panel(title(name, accent), accent, p);
     let block = if stats_label.is_empty() {
         block
     } else {
-        block.title(right_title(stats_label))
+        block.title(right_title(stats_label, p))
     };
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -941,7 +1045,7 @@ fn area_chart(
 
     let values = series.map(Series::values).unwrap_or_default();
     let max = nice_max(stats.map(|s| s.peak).unwrap_or(0.0));
-    draw_grid(f, inner, graph, max, axis_width);
+    draw_grid(f, inner, graph, max, axis_width, p);
 
     if values.is_empty() {
         let message = "○  WAITING FOR SAMPLES";
@@ -952,16 +1056,16 @@ fn area_chart(
             y,
             message,
             graph.width as usize,
-            Style::new().fg(DIM).bg(SURFACE),
+            Style::new().fg(p.dim).bg(p.surface),
         );
     } else {
         let data = resample_series(&values, graph.width as usize);
-        draw_area(f, graph, &data, max, accent);
+        draw_area(f, graph, &data, max, accent, p);
     }
 
     if time_height > 0 {
         let y = inner.bottom().saturating_sub(1);
-        let style = Style::new().fg(DIM).bg(SURFACE);
+        let style = Style::new().fg(p.dim).bg(p.surface);
         f.buffer_mut()
             .set_stringn(graph.x, y, "older", graph.width as usize, style);
         if graph.width > 16 {
@@ -977,13 +1081,13 @@ fn area_chart(
     }
 }
 
-fn draw_grid(f: &mut Frame, inner: Rect, graph: Rect, max: f64, axis_width: u16) {
+fn draw_grid(f: &mut Frame, inner: Rect, graph: Rect, max: f64, axis_width: u16, p: &Palette) {
     let buf = f.buffer_mut();
     for y in graph.y..graph.bottom() {
         for x in graph.x..graph.right() {
             buf[(x, y)]
                 .set_symbol("·")
-                .set_style(Style::new().fg(RAISED).bg(SURFACE));
+                .set_style(Style::new().fg(p.grid).bg(p.surface));
         }
     }
     if axis_width == 0 {
@@ -1002,12 +1106,12 @@ fn draw_grid(f: &mut Frame, inner: Rect, graph: Rect, max: f64, axis_width: u16)
             y,
             label,
             axis_width.saturating_sub(1) as usize,
-            Style::new().fg(DIM).bg(SURFACE),
+            Style::new().fg(p.dim).bg(p.surface),
         );
     }
 }
 
-fn draw_area(f: &mut Frame, area: Rect, values: &[f64], max: f64, accent: Color) {
+fn draw_area(f: &mut Frame, area: Rect, values: &[f64], max: f64, accent: Color, p: &Palette) {
     let buf = f.buffer_mut();
     let height = area.height as usize;
     for (column, value) in values.iter().enumerate() {
@@ -1028,17 +1132,17 @@ fn draw_area(f: &mut Frame, area: Rect, values: &[f64], max: f64, accent: Color)
             let color = if is_top {
                 accent
             } else {
-                shade(accent, strength)
+                shade(accent, strength, p.fill_base)
             };
             buf[(x, y)]
                 .set_symbol("█")
-                .set_style(Style::new().fg(color).bg(SURFACE));
+                .set_style(Style::new().fg(color).bg(p.surface));
         }
         if remainder > 0 && full_rows < height {
             let y = area.bottom() - 1 - full_rows as u16;
             buf[(x, y)]
                 .set_symbol(PARTIAL_BLOCKS[remainder])
-                .set_style(Style::new().fg(accent).bg(SURFACE));
+                .set_style(Style::new().fg(accent).bg(p.surface));
         }
     }
 }
@@ -1079,14 +1183,19 @@ fn resample_series(values: &[f64], width: usize) -> Vec<f64> {
         .collect()
 }
 
-fn shade(color: Color, factor: f64) -> Color {
-    match color {
-        Color::Rgb(r, g, b) => Color::Rgb(
-            (r as f64 * factor).round().clamp(0.0, 255.0) as u8,
-            (g as f64 * factor).round().clamp(0.0, 255.0) as u8,
-            (b as f64 * factor).round().clamp(0.0, 255.0) as u8,
-        ),
-        other => other,
+/// Blend an accent toward the theme's chart-fill base. Dark mode fades toward
+/// black as before; light mode fades toward white instead of creating black bars.
+fn shade(color: Color, factor: f64, base: Color) -> Color {
+    match (color, base) {
+        (Color::Rgb(r, g, b), Color::Rgb(br, bg, bb)) => {
+            let blend = |channel: u8, base: u8| {
+                (base as f64 + (channel as f64 - base as f64) * factor)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            Color::Rgb(blend(r, br), blend(g, bg), blend(b, bb))
+        }
+        (other, _) => other,
     }
 }
 
@@ -1094,7 +1203,7 @@ fn shade(color: Color, factor: f64) -> Color {
 // Prometheus grid
 // ---------------------------------------------------------------------------
 
-fn draw_prom_table(f: &mut Frame, area: Rect, st: &State) {
+fn draw_prom_table(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let mut rows: Vec<(String, f64)> = st
         .series
         .iter()
@@ -1108,10 +1217,10 @@ fn draw_prom_table(f: &mut Frame, area: Rect, st: &State) {
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows.sort_by_key(|(name, _)| !name.starts_with("llamacpp:"));
 
-    let block = panel(title("prometheus", CYAN), CYAN).title(right_title(format!(
-        "{} series · m to hide",
-        st.prom_discovered
-    )));
+    let block = panel(title("prometheus", p.cyan), p.cyan, p).title(right_title(
+        format!("{} series · m to hide", st.prom_discovered),
+        p,
+    ));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.is_empty() {
@@ -1121,7 +1230,7 @@ fn draw_prom_table(f: &mut Frame, area: Rect, st: &State) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 "waiting for prometheus series…",
-                Style::new().fg(DIM),
+                Style::new().fg(p.dim),
             )),
             inner,
         );
@@ -1146,12 +1255,12 @@ fn draw_prom_table(f: &mut Frame, area: Rect, st: &State) {
             .take(rows_per_column)
             .map(|(name, value)| {
                 Row::new(vec![
-                    Cell::from(name.clone()).style(Style::new().fg(MUTED)),
+                    Cell::from(name.clone()).style(Style::new().fg(p.muted)),
                     Cell::from(Line::from(Span::styled(
                         fmt_num(*value),
-                        Style::new().fg(CYAN),
+                        Style::new().fg(p.cyan),
                     )))
-                    .style(Style::new().fg(CYAN)),
+                    .style(Style::new().fg(p.cyan)),
                 ])
             })
             .collect();
@@ -1164,7 +1273,7 @@ fn draw_prom_table(f: &mut Frame, area: Rect, st: &State) {
             [Constraint::Min(12), Constraint::Length(value_width)],
         )
         .column_spacing(1)
-        .style(Style::new().bg(SURFACE));
+        .style(Style::new().bg(p.surface));
         f.render_widget(table, *column);
     }
 }
@@ -1314,7 +1423,7 @@ mod tests {
     fn render_at(st: &State, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, st)).unwrap();
+        terminal.draw(|f| draw(f, st, Theme::Dark)).unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -1349,8 +1458,38 @@ mod tests {
         assert!(screen.contains("context window"), "{screen}");
         assert!(screen.contains("request activity"), "{screen}");
         assert!(screen.contains("no inference requests sent"), "{screen}");
+        assert!(screen.contains("t light"), "{screen}");
         assert!(screen.contains("q quit"), "{screen}");
         assert!(screen.contains("passive"), "{screen}");
+    }
+
+    #[test]
+    fn light_theme_uses_light_surfaces_and_dark_text() {
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw(f, &sample_state(), Theme::Light))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+
+        assert_eq!(buf[(0, 0)].bg, LIGHT_PALETTE.surface);
+        assert_eq!(buf[(119, 35)].bg, LIGHT_PALETTE.bg);
+        assert_eq!(buf[(4, 1)].fg, LIGHT_PALETTE.heading);
+        assert_eq!(buf[(2, 1)].fg, LIGHT_PALETTE.cyan);
+    }
+
+    #[test]
+    fn theme_toggles_between_dark_and_light() {
+        assert_eq!(Theme::Dark.toggle(), Theme::Light);
+        assert_eq!(Theme::Light.toggle(), Theme::Dark);
+    }
+
+    #[test]
+    fn light_chart_fills_blend_toward_white() {
+        assert_eq!(
+            shade(Color::Rgb(100, 150, 200), 0.5, LIGHT_PALETTE.fill_base),
+            Color::Rgb(178, 203, 228)
+        );
     }
 
     #[test]

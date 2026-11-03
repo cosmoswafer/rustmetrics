@@ -26,7 +26,7 @@ That's it. If the server is reachable you get a live dashboard:
 │ ● bonsai27 LOADED │ │ 200.0 ··············································· │
 │ CTX 65.5k         │ │ 100.0 ▃▄▅▆▇███████████████████████████████████████████ │
 ╰───────────────────╯ ╰────────────────────────────────────────────────────────╯
- tab model   m metrics   r refresh   q quit        ● passive · prometheus
+ tab model   m metrics   t light   r refresh   q quit        ● passive · prometheus
 ```
 
 ## Is my server running? What URL do I use?
@@ -79,6 +79,7 @@ Both server shapes are supported and auto-detected:
 | --- | --- |
 | `tab` | Pin the next active/loaded model (charts follow it) |
 | `m` | Toggle the Prometheus panel |
+| `t` | Toggle between the dark and light themes |
 | `r` | Force a refresh now |
 | `q` / `esc` / `ctrl-c` | Quit |
 
@@ -108,6 +109,9 @@ rustmetrics llamacpp --url http://localhost:2464 --interval 0.5
 
 # the normal TUI is always passive; no inference requests are sent
 rustmetrics llamacpp --url http://localhost:2464
+
+# start in light mode (or press `t` in the TUI to switch themes)
+rustmetrics llamacpp --url http://localhost:2464 --light
 
 # follow a specific model from startup
 rustmetrics llamacpp --url http://localhost:2464 --model gemma4

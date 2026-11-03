@@ -58,6 +58,10 @@ pub struct LlamaArgs {
     #[arg(long, env = "LLAMACPP_API_KEY", value_name = "KEY")]
     pub api_key: Option<String>,
 
+    /// Start with the light color scheme (toggle at runtime with `t`)
+    #[arg(long)]
+    pub light: bool,
+
     /// Poll once, print a summary and exit instead of running the TUI
     #[arg(long)]
     pub once: bool,
@@ -213,7 +217,12 @@ async fn tui_run(collector: Arc<Collector>, state: Arc<Mutex<State>>, args: Llam
         cmd_rx,
         args.interval,
     ));
-    let res = event_loop(&mut terminal, &state, &mut ev_rx, &cmd_tx).await;
+    let theme = if args.light {
+        tui::Theme::Light
+    } else {
+        tui::Theme::Dark
+    };
+    let res = event_loop(&mut terminal, &state, &mut ev_rx, &cmd_tx, theme).await;
     ratatui::restore();
     match res {
         Ok(()) => ExitCode::SUCCESS,
@@ -249,6 +258,7 @@ async fn event_loop(
     state: &Arc<Mutex<State>>,
     ev_rx: &mut UnboundedReceiver<Event>,
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<PollCmd>,
+    mut theme: tui::Theme,
 ) -> io::Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     loop {
@@ -267,6 +277,9 @@ async fn event_loop(
                             let mut g = state.lock().unwrap();
                             g.show_metrics = !g.show_metrics;
                         }
+                        KeyCode::Char('t') => {
+                            theme = theme.toggle();
+                        }
                         KeyCode::Char('r') => {
                             let _ = cmd_tx.send(PollCmd::Refresh);
                         }
@@ -277,7 +290,7 @@ async fn event_loop(
             }
         }
         let g = state.lock().unwrap();
-        terminal.draw(|f| tui::draw(f, &g))?;
+        terminal.draw(|f| tui::draw(f, &g, theme))?;
     }
     Ok(())
 }

@@ -64,10 +64,11 @@ or loaded models are selected automatically; `--model NAME` pins one explicitly.
 | `--model` | first active | Pin the model to watch |
 | `--window` | `300` | Chart history window in seconds |
 | `--api-key` | none | Bearer token if the server requires auth |
+| `--light` | off | Start with the light color scheme |
 | `--once` | off | Poll once, print a summary and exit (scripting) |
 
-Keys: `tab` switch active model · `m` toggle metrics panel · `r` refresh now ·
-`q` quit.
+Keys: `tab` switch active model · `m` toggle metrics panel · `t` toggle
+light/dark theme · `r` refresh now · `q` quit.
 
 Probe-test a server from the CLI without a terminal:
 

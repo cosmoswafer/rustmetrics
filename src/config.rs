@@ -150,6 +150,7 @@ mod tests {
             "--window",
             "60",
             "--no-probe",
+            "--light",
             "--once",
         ])
         .unwrap();
@@ -162,6 +163,7 @@ mod tests {
         assert_eq!(args.model.as_deref(), Some("lfm25"));
         assert_eq!(args.window, 60.0);
         assert!(!args.probe);
+        assert!(args.light);
         assert!(args.once);
     }
 
@@ -176,6 +178,7 @@ mod tests {
         assert!(args.probe);
         assert_eq!(args.probe_tokens, 16);
         assert_eq!(args.window, 300.0);
+        assert!(!args.light);
         assert!(!args.once);
     }
 
