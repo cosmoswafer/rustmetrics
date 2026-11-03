@@ -156,6 +156,14 @@ impl Trend {
     }
 }
 
+fn model_column_width(width: u16) -> u16 {
+    if width >= 140 {
+        40
+    } else {
+        36
+    }
+}
+
 pub fn draw(f: &mut Frame, st: &State, theme: Theme) {
     let p = theme.palette();
     f.render_widget(Block::default().style(Style::new().bg(p.bg)), f.area());
@@ -181,7 +189,7 @@ pub fn draw(f: &mut Frame, st: &State, theme: Theme) {
     let main = areas[main_index];
 
     if main.width >= 80 {
-        let sidebar_width = if main.width >= 140 { 40 } else { 36 };
+        let sidebar_width = model_column_width(main.width);
         let [left, right] =
             Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(40)])
                 .spacing(1)
@@ -379,10 +387,10 @@ fn draw_footer(f: &mut Frame, area: Rect, st: &State, theme: Theme, p: &Palette)
 fn draw_kpis(f: &mut Frame, area: Rect, st: &State, p: &Palette) {
     let focus = st.focus_model().map(|m| m.name.clone()).unwrap_or_default();
     let cards = Layout::horizontal([
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
+        Constraint::Length(model_column_width(area.width)),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
     ])
     .spacing(1)
     .split(area);
@@ -1498,6 +1506,29 @@ mod tests {
         assert!(screen.contains("t light"), "{screen}");
         assert!(screen.contains("q quit"), "{screen}");
         assert!(screen.contains("passive"), "{screen}");
+    }
+
+    #[test]
+    fn kpi_cards_align_with_main_columns() {
+        for width in 92..=200 {
+            let screen = render_at(&sample_state(), width, 36);
+            let lines: Vec<Vec<char>> = screen.lines().map(|line| line.chars().collect()).collect();
+            let corners = |row: usize| {
+                lines[row]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(x, c)| matches!(c, '╭' | '╮').then_some(x))
+                    .collect::<Vec<_>>()
+            };
+            let kpis = corners(4);
+            let main = corners(8);
+
+            assert_eq!(
+                (kpis[1], kpis[2]),
+                (main[1], main[2]),
+                "misaligned at width {width}\n{screen}"
+            );
+        }
     }
 
     #[test]
